@@ -13133,7 +13133,11 @@ def _client_controls_allowed(
     return _client_controls_default() == "honor"
 
 
-def _ignored_client_control_fields(request: BaseModel) -> list[str]:
+def _ignored_client_control_fields(
+    request: BaseModel,
+    *,
+    reasoning_controls_allowed: bool = False,
+) -> list[str]:
     """Request controls ignored unless the caller explicitly opts in.
 
     MTPLX-owned launch/live settings are the authority for generation
@@ -13151,9 +13155,15 @@ def _ignored_client_control_fields(request: BaseModel) -> list[str]:
         fields.append("presence_penalty")
     if getattr(request, "frequency_penalty", None) is not None:
         fields.append("frequency_penalty")
-    if getattr(request, "enable_thinking", None) is not None:
+    if (
+        not reasoning_controls_allowed
+        and getattr(request, "enable_thinking", None) is not None
+    ):
         fields.append("enable_thinking")
-    if getattr(request, "reasoning_effort", None) is not None:
+    if (
+        not reasoning_controls_allowed
+        and getattr(request, "reasoning_effort", None) is not None
+    ):
         fields.append("reasoning_effort")
     if _request_generation_mode_value(request) is not None:
         fields.append("generation_mode")
@@ -16089,9 +16099,15 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "client_controls_allowed",
     "client_control_fields_ignored",
     "client_sampler_fields_ignored",
+    "reasoning_controls_allowed",
+    "reasoning_control_owner",
     "request_enable_thinking",
     "request_enable_thinking_override",
     "request_reasoning_mode",
+    "request_reasoning_effort_requested",
+    "request_reasoning_effort_resolved",
+    "request_reasoning_effort_source",
+    "reasoning_effort_template_supported",
     "request_reasoning_parser",
     "request_temperature",
     "request_top_p",
@@ -23885,6 +23901,129 @@ def _request_chat_template_kwargs(request: Any) -> dict[str, Any]:
     return raw if isinstance(raw, dict) else {}
 
 
+def _requested_enable_thinking(request: ChatCompletionRequest) -> bool | None:
+    """Return the explicit OpenAI/Qwen thinking toggle, if the client sent one."""
+
+    requested = request.enable_thinking
+    if requested is not None:
+        return bool(requested)
+    template_kwargs_value = _request_chat_template_kwargs(request).get(
+        "enable_thinking"
+    )
+    return template_kwargs_value if isinstance(template_kwargs_value, bool) else None
+
+
+def _requested_reasoning_effort(
+    request: ChatCompletionRequest,
+) -> tuple[Any | None, str | None]:
+    """Return a request's effort value and its OpenAI-compatible spelling.
+
+    OpenCode sends the top-level OpenAI-compatible field. Qwen's vLLM/SGLang
+    examples place the same value under ``chat_template_kwargs``. Preserve the
+    established top-level-wins rule used by ``enable_thinking``.
+    """
+
+    if request.reasoning_effort is not None:
+        return request.reasoning_effort, "top_level"
+    template_kwargs = _request_chat_template_kwargs(request)
+    if "reasoning_effort" in template_kwargs:
+        return template_kwargs["reasoning_effort"], "chat_template_kwargs"
+    return None, None
+
+
+def _normalize_requested_reasoning_effort(value: Any) -> str:
+    """Normalize client vocabulary without broadening server-default CLI flags."""
+
+    effort = str(value).strip().lower()
+    if effort == "none":
+        return "none"
+    # Qwen's current template treats minimal as the low tier. It is a request
+    # spelling, not a persistent server default, so keep argparse's existing
+    # server-default vocabulary unchanged.
+    if effort == "minimal":
+        return "low"
+    return _normalize_reasoning_effort(effort)
+
+
+def _reasoning_controls_allowed(
+    *,
+    client_controls_allowed: bool,
+    agent_middleware_active: bool,
+) -> bool:
+    """Whether a request may choose thinking/effort for this chat turn.
+
+    Transparent middleware is an explicit boundary: it preserves the calling
+    agent's protocol controls even when the caller is an MTPLX-managed label
+    such as OpenCode. This deliberately does not grant sampler, depth, or
+    generation-mode control, which remain governed by ``client_controls_allowed``.
+    """
+
+    return bool(client_controls_allowed or not agent_middleware_active)
+
+
+def _template_supports_qwen38_reasoning_effort(state: ServerState) -> bool:
+    """Whether the loaded template renders distinct Qwen low/xhigh prompts."""
+
+    if _model_family_for_state(state) != "qwen3_8":
+        return True
+    tokenizer = getattr(getattr(state, "runtime", None), "tokenizer", None)
+    profile = str(
+        getattr(state, "chat_template_profile", "")
+        or (getattr(state, "chat_template_report", {}) or {}).get("profile")
+        or ""
+    )
+    if profile == _CHAT_TEMPLATE_PROFILE_FROGGERIC_V22:
+        return True
+    if tokenizer is None or not hasattr(tokenizer, "apply_chat_template"):
+        return False
+    try:
+        messages = [{"role": "user", "content": ""}]
+        low = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=True,
+            reasoning_effort="low",
+        )
+        xhigh = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=True,
+            reasoning_effort="xhigh",
+        )
+    except Exception:
+        return False
+    return isinstance(low, str) and isinstance(xhigh, str) and low != xhigh
+
+
+def _require_qwen38_reasoning_effort_template(
+    state: ServerState,
+    *,
+    requested_effort: str | None,
+    resolved_effort: str | None,
+) -> bool:
+    """Fail explicit non-default Qwen effort instead of silently ignoring it."""
+
+    if _model_family_for_state(state) != "qwen3_8":
+        return True
+    if requested_effort in {None, "auto", "none", "medium"}:
+        return True
+    if resolved_effort not in {"low", "xhigh"}:
+        return True
+    supported = _template_supports_qwen38_reasoning_effort(state)
+    if not supported:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "the selected chat template cannot render Qwen 3.8 reasoning "
+                "effort; use --chat-template-profile froggeric_v22_1 or a "
+                "template that renders distinct low and xhigh prompts"
+            ),
+        )
+    return True
+
+
 def _thinking_enabled_for_request(
     state: ServerState,
     request: ChatCompletionRequest,
@@ -23893,13 +24032,7 @@ def _thinking_enabled_for_request(
 ) -> bool:
     if _reasoning_parser_for_state(state) == "none":
         return False
-    requested = request.enable_thinking
-    if requested is None:
-        template_kwargs_value = _request_chat_template_kwargs(request).get(
-            "enable_thinking"
-        )
-        if isinstance(template_kwargs_value, bool):
-            requested = template_kwargs_value
+    requested = _requested_enable_thinking(request)
     return (
         state.args.enable_thinking
         if requested is None or not allow_client_controls
@@ -23927,9 +24060,13 @@ def _reasoning_effort_for_state(
         else getattr(state.args, "reasoning_effort", None)
     )
     try:
-        effort = _normalize_reasoning_effort(
-            raw,
-            default=codec.default_effort or "auto",
+        effort = (
+            _normalize_requested_reasoning_effort(raw)
+            if client_supplied
+            else _normalize_reasoning_effort(
+                raw,
+                default=codec.default_effort or "auto",
+            )
         )
     except ValueError as exc:
         if client_supplied:
@@ -23938,6 +24075,8 @@ def _reasoning_effort_for_state(
             # F11 #8).
             raise HTTPException(status_code=400, detail=str(exc))
         raise
+    if effort == "none":
+        return None
     if effort == "auto":
         effort = codec.default_effort or "low"
     if effort in levels:
