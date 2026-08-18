@@ -563,6 +563,8 @@ def _add_reasoning_arg(
 ) -> None:
     parser.add_argument(
         "--reasoning",
+        "--reasoning-mode",
+        dest="reasoning",
         choices=["auto", "on", "off"],
         default=default,
         help=(

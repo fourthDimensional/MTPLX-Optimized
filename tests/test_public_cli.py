@@ -2236,12 +2236,24 @@ def test_serve_parser_accepts_bridge_prompt_flags():
             "serve",
             "--model",
             "/tmp/model",
+            "--agent-middleware",
+            "off",
             "--chat-template-profile",
             "froggeric_v22_1",
+            "--reasoning-mode",
+            "on",
+            "--reasoning-effort",
+            "medium",
+            "--reasoning-parser",
+            "qwen3",
         ]
     )
 
     assert qwen38_args.chat_template_profile == "froggeric_v22_1"
+    assert qwen38_args.agent_middleware == "off"
+    assert qwen38_args.reasoning == "on"
+    assert qwen38_args.reasoning_effort == "medium"
+    assert qwen38_args.reasoning_parser == "qwen3"
 
     gemma_args = parser.parse_args(
         [
@@ -2301,10 +2313,12 @@ def test_cli_reasoning_flags_parse_without_being_chat_text():
     quickstart = parser.parse_args(["start", "cli", "--reasoning", "on"])
     run = parser.parse_args(["run", "hello", "--reasoning", "off"])
     serve = parser.parse_args(["serve", "--reasoning", "auto"])
+    serve_mode_alias = parser.parse_args(["serve", "--reasoning-mode", "on"])
 
     assert quickstart.reasoning == "on"
     assert run.reasoning == "off"
     assert serve.reasoning == "auto"
+    assert serve_mode_alias.reasoning == "on"
 
 
 def test_start_missing_model_suggests_download(monkeypatch, capsys):
