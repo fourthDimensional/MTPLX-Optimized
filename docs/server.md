@@ -332,17 +332,48 @@ example OpenCode with a Qwen template that supports native tools), start the
 forked server with:
 
 ```bash
-mtplx serve --host 127.0.0.1 --port 8006 --agent-middleware off \
-  --chat-template-profile froggeric_v21_3
+uv run mtplx serve --host 127.0.0.1 --port 8006 \
+  --agent-middleware off \
+  --chat-template-profile froggeric_v22_1 \
+  --reasoning-mode on \
+  --reasoning-effort medium \
+  --reasoning-parser qwen3
 ```
 
 In this mode MTPLX preserves the incoming system, developer, user, assistant,
 and tool history (with the protocol-required developer-to-system conversion for
 Qwen templates) and passes the complete incoming `tools` array to the native
-chat template. `froggeric_v21_3` is the bundled Qwen template with native tool
-support; a custom tokenizer template is also valid if it accepts `tools`. It
-does not canonicalize or compact the transcript, replace the tool inventory with
-a text contract, or inject MTPLX agent prompts and retry reminders. If a
+chat template. `froggeric_v22_1` is the bundled Qwen 3.8 template with native
+tool support and request-selectable `low`, `medium`, and `xhigh` reasoning.
+It does not canonicalize or compact the transcript, replace the tool inventory
+with a text contract, or inject MTPLX agent prompts and retry reminders. If a
 selected template cannot render native tools, the request fails explicitly
 instead of silently dropping them. Session-bank postcommit rewriting and its
 cache reuse are intentionally disabled in transparent mode.
+
+### Transparent-mode reasoning effort
+
+With `--agent-middleware off`, an OpenAI-compatible caller owns only its
+reasoning controls; MTPLX still owns sampling, MTP depth, and generation mode.
+This applies to OpenCode and to other callers without an opt-in header. Send an
+effort either at top level or in Qwen's vLLM/SGLang-style template kwargs:
+
+```json
+{"reasoning_effort": "xhigh"}
+```
+
+```json
+{"chat_template_kwargs": {"reasoning_effort": "low"}}
+```
+
+The top-level field wins when both are present. Qwen aliases `minimal` to
+`low`, and OpenCode's `high` to `xhigh`; `none` disables thinking. Combining
+`reasoning_effort: "none"` with `enable_thinking: true` is rejected as a
+conflicting request. The response's `mtplx_stats` records the original request
+value/source and the resolved effort.
+
+`froggeric_v21_3` supports on/off thinking only; use `froggeric_v22_1` for
+effort switching. A custom Qwen 3.8 template must render distinct `low` and
+`xhigh` prompts or an explicit non-default effort request fails with a clear
+400 instead of being silently ignored. Legacy `--agent-middleware on` keeps its
+server-owned reasoning policy unchanged.
