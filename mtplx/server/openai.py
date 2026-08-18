@@ -7017,6 +7017,9 @@ _TOOL_PROMPT_MODES = {
     _TOOL_PROMPT_MODE_NATIVE,
     _TOOL_PROMPT_MODE_COMPACT,
 }
+_AGENT_MIDDLEWARE_ON = "on"
+_AGENT_MIDDLEWARE_OFF = "off"
+_AGENT_MIDDLEWARE_MODES = {_AGENT_MIDDLEWARE_ON, _AGENT_MIDDLEWARE_OFF}
 _TOOL_CONTRACT_AGENT_CLIENT_HINTS = ("opencode", "pi", "hermes")
 _TOOL_PROMPT_MODE_REQUEST_HEADERS = (
     "x-mtplx-tool-prompt-mode",
@@ -7066,6 +7069,17 @@ def _tool_prompt_mode_from_args(args: argparse.Namespace) -> str:
         getattr(args, "tool_prompt_mode", None),
         default=os.environ.get("MTPLX_TOOL_PROMPT_MODE", _TOOL_PROMPT_MODE_HYBRID),
     )
+
+
+def _agent_middleware_enabled_from_args(args: argparse.Namespace) -> bool:
+    value = getattr(args, "agent_middleware", None)
+    if value is None:
+        value = os.environ.get("MTPLX_AGENT_MIDDLEWARE", _AGENT_MIDDLEWARE_ON)
+    mode = str(value).strip().lower()
+    if mode not in _AGENT_MIDDLEWARE_MODES:
+        allowed = ", ".join(sorted(_AGENT_MIDDLEWARE_MODES))
+        raise ValueError(f"agent_middleware must be one of: {allowed}")
+    return mode == _AGENT_MIDDLEWARE_ON
 
 
 def _tool_contract_active_for_mode(
@@ -13425,6 +13439,17 @@ def _canonicalize_agent_transcript(
     return canonical, stats
 
 
+def _passthrough_agent_transcript(
+    messages: list[ChatMessage],
+) -> tuple[list[ChatMessage], AgentTranscriptCanonicalization]:
+    """Return incoming history unchanged for transparent agent middleware."""
+    total_chars = sum(len(_content_to_text(message.content)) for message in messages)
+    return list(messages), AgentTranscriptCanonicalization(
+        raw_message_chars=total_chars,
+        canonical_message_chars=total_chars,
+    )
+
+
 def _message_to_template_dict(
     message: ChatMessage,
     *,
@@ -13491,6 +13516,62 @@ def _message_to_template_dict(
     if content or message.role == "tool" or message.tool_calls:
         return item
     return None
+
+
+def _transparent_message_to_template_dict(
+    message: ChatMessage,
+    *,
+    include_reasoning_content: bool = False,
+) -> dict[str, Any] | None:
+    """Convert one OpenAI message without rewriting its transcript.
+
+    Qwen templates use ``system`` in place of OpenAI's ``developer`` role and
+    expect parsed function arguments for assistant tool-call history.  Those
+    are protocol conversions.  Everything else, including message order,
+    repeated turns, and tool-result bytes, passes through unchanged.
+    """
+    role = str(message.role or "").strip().lower()
+    if not role:
+        return None
+    if role == "developer":
+        role = "system"
+    content = _content_to_text(message.content)
+    item: dict[str, Any] = {"role": role, "content": content}
+    if include_reasoning_content and role == "assistant":
+        for key in ("reasoning_content", "reasoning"):
+            reasoning = _message_extra(message, key)
+            if reasoning:
+                item["reasoning_content"] = str(reasoning)
+                break
+    if message.name:
+        item["name"] = message.name
+    if message.tool_call_id:
+        item["tool_call_id"] = message.tool_call_id
+    if message.tool_calls:
+        item["tool_calls"] = [_template_tool_call(call) for call in message.tool_calls]
+    if content or role == "tool" or message.tool_calls:
+        return item
+    return None
+
+
+def _transparent_messages_for_template(
+    messages: list[ChatMessage],
+    *,
+    include_reasoning_content: bool = False,
+) -> list[dict[str, Any]]:
+    """Apply only required OpenAI-to-Qwen protocol conversions."""
+    converted = [
+        item
+        for message in messages
+        if (
+            item := _transparent_message_to_template_dict(
+                message,
+                include_reasoning_content=include_reasoning_content,
+            )
+        )
+        is not None
+    ]
+    return converted or [{"role": "user", "content": ""}]
 
 
 def _coerce_token_ids(encoded: Any) -> list[int]:
@@ -14785,6 +14866,7 @@ def _encode_messages(
     tools: list[dict[str, Any]] | None = None,
     tool_choice: Any = None,
     tool_prompt_mode: str = _TOOL_PROMPT_MODE_HYBRID,
+    agent_middleware: bool = True,
     template_observability: dict[str, Any] | None = None,
     allow_committed_reasoning: bool = False,
 ) -> list[int]:
@@ -14808,6 +14890,7 @@ def _encode_messages(
             tools=tools,
             tool_choice=tool_choice,
             tool_prompt_mode=tool_prompt_mode,
+            agent_middleware=agent_middleware,
             template_observability=template_observability,
             allow_committed_reasoning=allow_committed_reasoning,
         )
@@ -14830,6 +14913,7 @@ def _encode_messages(
                 "tools": tools,
                 "tool_choice": tool_choice,
                 "tool_prompt_mode": tool_prompt_mode,
+                "agent_middleware": bool(agent_middleware),
                 "committed_reasoning": bool(allow_committed_reasoning),
                 # The rendered prompt embeds the current date (tool contract's
                 # burst-pinned _current_date_line; hypothetically also
@@ -14871,6 +14955,7 @@ def _encode_messages(
         tools=tools,
         tool_choice=tool_choice,
         tool_prompt_mode=tool_prompt_mode,
+        agent_middleware=agent_middleware,
         template_observability=fresh_observability,
         allow_committed_reasoning=allow_committed_reasoning,
     )
@@ -14895,6 +14980,7 @@ def _encode_messages_uncached(
     tools: list[dict[str, Any]] | None = None,
     tool_choice: Any = None,
     tool_prompt_mode: str = _TOOL_PROMPT_MODE_HYBRID,
+    agent_middleware: bool = True,
     template_observability: dict[str, Any] | None = None,
     allow_committed_reasoning: bool = False,
 ) -> list[int]:
@@ -14905,48 +14991,44 @@ def _encode_messages_uncached(
     template_preserve_thinking = (
         not strip_assistant_reasoning_history and not scoped_reasoning_history
     )
-    # Preserve-mode echo-carry (2026-08-21): thinking transcripts render the
-    # client's echoed reasoning as the BASE history, so a turn the committed
-    # stream doesn't cover shows the model its own prior thinking instead of
-    # an empty scaffold (postcommit-starvation receipts: committed froze at
-    # 15,389 while the stream passed 76k and the model re-derived a 57.8k-token
-    # turn from scratch). Committed-think substitution still overwrites covered
-    # turns inside _message_to_template_dict, so KV-exact bytes win wherever
-    # they exist. Thinking-off and strip keep their pinned legacy renders.
     gemma4_encoding = is_gemma4_tokenizer(tokenizer)
     include_reasoning = (
         scoped_reasoning_history
-        or (
-            preserve_reasoning_history
-            and enable_thinking
-            and not strip_assistant_reasoning_history
-        )
-        # Gemma 4's direct encoder needs the echoed reasoning to reproduce the
-        # committed token stream even when the general preserve mode is off.
+        or (preserve_reasoning_history and enable_thinking and not strip_assistant_reasoning_history)
         or (gemma4_encoding and not strip_assistant_reasoning_history)
     )
-    prepared_messages: list[dict[str, Any]] = []
-    for message in messages:
-        item = _message_to_template_dict(
-            message,
-            strip_assistant_reasoning_history=strip_assistant_reasoning_history,
-            include_reasoning_content=include_reasoning,
-            allow_committed_reasoning=allow_committed_reasoning,
+    if agent_middleware:
+        prepared_messages: list[dict[str, Any]] = []
+        for message in messages:
+            item = _message_to_template_dict(
+                message,
+                strip_assistant_reasoning_history=strip_assistant_reasoning_history,
+                include_reasoning_content=include_reasoning,
+                allow_committed_reasoning=allow_committed_reasoning,
+            )
+            if item is not None:
+                prepared_messages.append(item)
+        normalized = omlx_normalize_messages_for_template(
+            prepared_messages,
+            tokenizer=tokenizer,
+            native_reasoning_content=not strip_assistant_reasoning_history,
         )
-        if item is not None:
-            prepared_messages.append(item)
-    normalized = omlx_normalize_messages_for_template(
-        prepared_messages,
-        tokenizer=tokenizer,
-        native_reasoning_content=not strip_assistant_reasoning_history,
+        if strip_assistant_reasoning_history:
+            for item in normalized:
+                item.pop("reasoning_content", None)
+        if not normalized:
+            normalized = [{"role": "user", "content": ""}]
+    else:
+        normalized = _transparent_messages_for_template(
+            messages,
+            include_reasoning_content=include_reasoning,
+        )
+    effective_tool_prompt_mode = (
+        _normalize_tool_prompt_mode(tool_prompt_mode)
+        if agent_middleware
+        else _TOOL_PROMPT_MODE_NATIVE
     )
-    if strip_assistant_reasoning_history:
-        for item in normalized:
-            item.pop("reasoning_content", None)
-    if not normalized:
-        normalized = [{"role": "user", "content": ""}]
-    effective_tool_prompt_mode = _normalize_tool_prompt_mode(tool_prompt_mode)
-    if _tool_contract_active_for_mode(
+    if agent_middleware and _tool_contract_active_for_mode(
         tools_active=bool(tools),
         tool_prompt_mode=effective_tool_prompt_mode,
     ):
@@ -14956,7 +15038,11 @@ def _encode_messages_uncached(
             tool_choice=tool_choice,
             observability=template_observability,
         )
-    elif effective_tool_prompt_mode == _TOOL_PROMPT_MODE_NATIVE and tools:
+    elif (
+        agent_middleware
+        and effective_tool_prompt_mode == _TOOL_PROMPT_MODE_NATIVE
+        and tools
+    ):
         normalized, native_tail_added = _with_mtplx_native_agent_tail(
             normalized,
             tools=tools,
@@ -14986,19 +15072,27 @@ def _encode_messages_uncached(
             preserve_thinking=not strip_assistant_reasoning_history,
             tools=native_tools,
         )
-    template_tools = _template_tools_for_prompt_mode(
-        tools,
-        tool_prompt_mode=effective_tool_prompt_mode,
+    template_tools = (
+        tools
+        if not agent_middleware
+        else _template_tools_for_prompt_mode(
+            tools,
+            tool_prompt_mode=effective_tool_prompt_mode,
+        )
     )
-    segmented_tool_history = _encode_generation_compatible_tool_history(
-        tokenizer,
-        normalized,
-        add_generation_prompt=add_generation_prompt,
-        enable_thinking=enable_thinking,
-        reasoning_effort=reasoning_effort,
-        preserve_thinking=template_preserve_thinking,
-        tools=template_tools,
-        template_observability=template_observability,
+    segmented_tool_history = (
+        _encode_generation_compatible_tool_history(
+            tokenizer,
+            normalized,
+            add_generation_prompt=add_generation_prompt,
+            enable_thinking=enable_thinking,
+            reasoning_effort=reasoning_effort,
+            preserve_thinking=template_preserve_thinking,
+            tools=template_tools,
+            template_observability=template_observability,
+        )
+        if agent_middleware
+        else None
     )
     if segmented_tool_history is not None:
         return segmented_tool_history
@@ -15136,6 +15230,11 @@ def _encode_messages_uncached(
             )
         except (TypeError, Exception) as chat_template_exc:
             if template_tools:
+                if not agent_middleware:
+                    raise HTTPException(
+                        status_code=500,
+                        detail="tokenizer chat template does not support native tools",
+                    )
                 try:
                     if template_observability is not None:
                         template_observability["tool_template_fallback"] = True
@@ -15159,6 +15258,11 @@ def _encode_messages_uncached(
             )
     except Exception as chat_template_exc:
         if template_tools:
+            if not agent_middleware:
+                raise HTTPException(
+                    status_code=500,
+                    detail="tokenizer chat template does not support native tools",
+                )
             try:
                 if template_observability is not None:
                     template_observability["tool_template_fallback"] = True
@@ -15225,16 +15329,25 @@ def _render_messages_for_postcommit(
     preserve_thinking: bool,
     tools: list[dict[str, Any]] | None,
     tool_prompt_mode: str = _TOOL_PROMPT_MODE_HYBRID,
+    agent_middleware: bool = True,
 ) -> str | None:
-    effective_tool_prompt_mode = _normalize_tool_prompt_mode(tool_prompt_mode)
-    if _tool_contract_active_for_mode(
+    effective_tool_prompt_mode = (
+        _normalize_tool_prompt_mode(tool_prompt_mode)
+        if agent_middleware
+        else _TOOL_PROMPT_MODE_NATIVE
+    )
+    if agent_middleware and _tool_contract_active_for_mode(
         tools_active=bool(tools),
         tool_prompt_mode=effective_tool_prompt_mode,
     ):
         normalized = _with_mtplx_tool_contract(normalized, tools=tools)
-    template_tools = _template_tools_for_prompt_mode(
-        tools,
-        tool_prompt_mode=effective_tool_prompt_mode,
+    template_tools = (
+        tools
+        if not agent_middleware
+        else _template_tools_for_prompt_mode(
+            tools,
+            tool_prompt_mode=effective_tool_prompt_mode,
+        )
     )
     return _render_messages_with_chat_template(
         tokenizer,
@@ -15311,6 +15424,7 @@ def _postcommit_next_turn_prefix_ids(
     tools: list[dict[str, Any]] | None,
     assistant_tool_calls: list[dict[str, Any]] | None,
     tool_prompt_mode: str = _TOOL_PROMPT_MODE_HYBRID,
+    agent_middleware: bool = True,
 ) -> list[int] | None:
     # Same echo-carry rule as _encode_messages_uncached: the postcommit
     # prediction must render the exact bytes the next request's encode will,
@@ -15333,23 +15447,38 @@ def _postcommit_next_turn_prefix_ids(
 
     normalized: list[dict[str, Any]] = []
     for message in history_messages:
-        item = _message_to_template_dict(
-            message,
-            strip_assistant_reasoning_history=strip_assistant_reasoning_history,
-            include_reasoning_content=include_reasoning,
-            # Postcommit predicts the NEXT turn's render: when this request
-            # served canonicalized history (committed-think substitution),
-            # the prediction must render the same substituted bytes or the
-            # banked entry diverges from every future canonicalized encode.
-            # The field only exists on server-built message copies.
-            allow_committed_reasoning=True,
+        item = (
+            _message_to_template_dict(
+                message,
+                strip_assistant_reasoning_history=strip_assistant_reasoning_history,
+                include_reasoning_content=include_reasoning,
+                # Postcommit predicts the NEXT turn's render: when this request
+                # served canonicalized history (committed-think substitution),
+                # the prediction must render the same substituted bytes or the
+                # banked entry diverges from every future canonicalized encode.
+                # The field only exists on server-built message copies.
+                allow_committed_reasoning=True,
+            )
+            if agent_middleware
+            else _transparent_message_to_template_dict(
+                message,
+                include_reasoning_content=include_reasoning,
+            )
         )
         if item is not None:
             normalized.append(item)
-    item = _message_to_template_dict(
-        sentinel_message,
-        strip_assistant_reasoning_history=strip_assistant_reasoning_history,
-        include_reasoning_content=include_reasoning,
+            last_history_role = str(item.get("role") or "")
+    item = (
+        _message_to_template_dict(
+            sentinel_message,
+            strip_assistant_reasoning_history=strip_assistant_reasoning_history,
+            include_reasoning_content=include_reasoning,
+        )
+        if agent_middleware
+        else _transparent_message_to_template_dict(
+            sentinel_message,
+            include_reasoning_content=include_reasoning,
+        )
     )
     if item is not None:
         normalized.append(item)
@@ -15371,6 +15500,7 @@ def _postcommit_next_turn_prefix_ids(
         ),
         tools=tools,
         tool_prompt_mode=tool_prompt_mode,
+        agent_middleware=agent_middleware,
     )
     if not rendered:
         return None
@@ -17534,6 +17664,11 @@ def _startup_health_payload(state: "ServerState") -> dict[str, Any]:
         "backend": backend.to_dict(),
         "model_controls": model_controls,
         "warmup": state.warmup_status,
+        "agent_middleware": (
+            _AGENT_MIDDLEWARE_ON
+            if _agent_middleware_enabled_from_args(state.args)
+            else _AGENT_MIDDLEWARE_OFF
+        ),
         "tool_prompt_mode": tool_prompt_mode,
         "tool_contract_active": _tool_contract_active_for_mode(
             tools_active=True,
@@ -18160,6 +18295,11 @@ def _mtplx_current_settings(state: "ServerState") -> dict[str, Any]:
     tool_prompt_mode = _tool_prompt_mode_from_args(args)
     return {
         "reasoning": reasoning,
+        "agent_middleware": (
+            _AGENT_MIDDLEWARE_ON
+            if _agent_middleware_enabled_from_args(args)
+            else _AGENT_MIDDLEWARE_OFF
+        ),
         "tool_prompt_mode": tool_prompt_mode,
         "tool_contract_active": _tool_contract_active_for_mode(
             tools_active=True,
@@ -20842,6 +20982,7 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "request_metadata_keys",
     "request_client_hint",
     "request_client_label",
+    "agent_middleware",
     "mtplx_control_owner",
     "client_controls_allowed",
     "client_control_fields_ignored",
@@ -22122,6 +22263,7 @@ def _store_retokenized_history_snapshot(
     pending_record: Any | None = None,
     keep_live_ref: bool = True,
     tool_prompt_mode: str | None = None,
+    agent_middleware: bool = True,
     strip_tool_call_preamble_text: bool = False,
     committed_stream_ids: Sequence[int] | None = None,
 ) -> dict[str, Any]:
@@ -22155,6 +22297,7 @@ def _store_retokenized_history_snapshot(
         reasoning_effort=reasoning_effort,
         tool_specs=tool_specs,
         tool_prompt_mode=tool_prompt_mode,
+        agent_middleware=agent_middleware,
         strip_tool_call_preamble_text=strip_tool_call_preamble_text,
         committed_stream_ids=committed_stream_ids,
     )
@@ -22515,6 +22658,7 @@ def _history_ids_for_postcommit(
     reasoning_effort: str | None = None,
     tool_specs: list[dict[str, Any]] | None = None,
     tool_prompt_mode: str | None = None,
+    agent_middleware: bool = True,
     strip_tool_call_preamble_text: bool = False,
     committed_stream_ids: Sequence[int] | None = None,
     session_committed_ids: Sequence[int] | None = None,
@@ -22570,7 +22714,7 @@ def _history_ids_for_postcommit(
     if timing is not None:
         timing["vision_images"] = len(postcommit_vision_images)
     postcommit_transcript_stats: Any | None = None
-    if tool_specs:
+    if tool_specs and agent_middleware:
         # The generation prompt may compact the current large read as an
         # active-read excerpt. Once the assistant response is appended, that
         # same tool result is historical context for the next OpenCode turn
@@ -22611,7 +22755,8 @@ def _history_ids_for_postcommit(
     # keeps allow_committed_reasoning encodes clean.
     substitution_walked = False
     if (
-        committed_stream_ids
+        agent_middleware
+        and committed_stream_ids
         and thinking_enabled
         and _committed_reasoning_canonicalization_enabled()
         and not getattr(state.args, "strip_assistant_reasoning_history", False)
@@ -22678,7 +22823,7 @@ def _history_ids_for_postcommit(
                     )
                     history_messages[-1:] = current
                 substitution_walked = True
-    if not substitution_walked:
+    if agent_middleware and not substitution_walked:
         history_messages = [
             _scrub_inbound_committed_reasoning(message) for message in history_messages
         ]
@@ -22694,6 +22839,7 @@ def _history_ids_for_postcommit(
         tools=tool_specs,
         assistant_tool_calls=assistant_tool_calls,
         tool_prompt_mode=effective_tool_prompt_mode,
+        agent_middleware=agent_middleware,
     )
     history_ids = next_turn_prefix_ids or _encode_messages(
         state.runtime.tokenizer,
@@ -22706,6 +22852,7 @@ def _history_ids_for_postcommit(
         add_generation_prompt=False,
         tools=tool_specs,
         tool_prompt_mode=effective_tool_prompt_mode,
+        agent_middleware=agent_middleware,
         # Substituted interiors ride _COMMITTED_REASONING_FIELD on
         # server-built copies; without this flag the fallback encode
         # silently drops them and the prefix stops extending the session.
@@ -22761,6 +22908,7 @@ def _generation_final_postcommit_compatibility(
     reasoning_effort: str | None = None,
     tool_specs: list[dict[str, Any]] | None = None,
     tool_prompt_mode: str | None = None,
+    agent_middleware: bool = True,
     strip_tool_call_preamble_text: bool = False,
     session: Any | None = None,
     timing: dict[str, Any] | None = None,
@@ -22822,6 +22970,7 @@ def _generation_final_postcommit_compatibility(
         reasoning_effort=reasoning_effort,
         tool_specs=tool_specs,
         tool_prompt_mode=tool_prompt_mode,
+        agent_middleware=agent_middleware,
         strip_tool_call_preamble_text=strip_tool_call_preamble_text,
         # The generation boundary IS the committed stream this snapshot
         # anchors: rendering the history with its think interiors is what
@@ -23106,6 +23255,7 @@ def _store_generation_final_history_snapshot(
     tool_specs: list[dict[str, Any]] | None = None,
     keep_live_ref: bool = True,
     tool_prompt_mode: str | None = None,
+    agent_middleware: bool = True,
     strip_tool_call_preamble_text: bool = False,
     session: Any | None = None,
 ) -> dict[str, Any]:
@@ -23138,6 +23288,7 @@ def _store_generation_final_history_snapshot(
         reasoning_effort=reasoning_effort,
         tool_specs=tool_specs,
         tool_prompt_mode=tool_prompt_mode,
+        agent_middleware=agent_middleware,
         strip_tool_call_preamble_text=strip_tool_call_preamble_text,
         session=session,
         timing=timing,
@@ -23322,6 +23473,7 @@ def _schedule_idle_postcommit_snapshot(
     expected_session_revision: int | None = None,
     keep_live_ref: bool = True,
     tool_prompt_mode: str | None = None,
+    agent_middleware: bool = True,
     strip_tool_call_preamble_text: bool = False,
     committed_stream_ids: Sequence[int] | None = None,
     retry_count: int = 0,
@@ -23577,6 +23729,7 @@ def _schedule_idle_postcommit_snapshot(
                     pending_record=record,
                     keep_live_ref=bool(keep_live_ref),
                     tool_prompt_mode=tool_prompt_mode,
+                    agent_middleware=agent_middleware,
                     strip_tool_call_preamble_text=strip_tool_call_preamble_text,
                     committed_stream_ids=committed_stream_ids,
                 )
@@ -28555,6 +28708,7 @@ def _nonstream_chat_message_parts(
     footer_allowed: bool | None = None,
     recover_unclosed_reasoning: bool = False,
     suppress_stats_footer: bool = False,
+    strip_mtplx_internal_markers: bool = True,
 ) -> tuple[str, str]:
     raw_text = _strip_generated_chat_template_sentinels(
         str(generated.get("text") or "")
@@ -28645,7 +28799,8 @@ def _nonstream_chat_message_parts(
             thinking_enabled=thinking_enabled,
         )
 
-    display_text = _strip_mtplx_internal_continuation_markers(display_text)
+    if strip_mtplx_internal_markers:
+        display_text = _strip_mtplx_internal_continuation_markers(display_text)
     finish_reason_for_parts = str(generated.get("finish_reason") or "")
     if (
         recover_unclosed_reasoning
@@ -32351,7 +32506,9 @@ def create_app(state: ServerState) -> FastAPI:
         opencode_client = policy.opencode_client
         tool_specs = policy.tool_specs
         prompt_tool_specs = policy.prompt_tool_specs
+        model_tool_specs = policy.model_tool_specs
         tools_active = policy.tools_active
+        agent_middleware_active = policy.agent_middleware_active
         agent_transcript_tools_active = policy.agent_transcript_tools_active
         read_only_force_answer_contract_active = (
             policy.read_only_force_answer_contract_active
@@ -32461,9 +32618,10 @@ def create_app(state: ServerState) -> FastAPI:
             strip_assistant_reasoning_history=state.args.strip_assistant_reasoning_history,
             scoped_reasoning_history=_reasoning_history_scoped_active(state),
             preserve_reasoning_history=_reasoning_history_preserve_echo_active(state),
-            tools=prompt_tool_specs,
+            tools=(prompt_tool_specs if agent_middleware_active else model_tool_specs) or None,
             tool_choice=request.tool_choice,
             tool_prompt_mode=template_tool_prompt_mode,
+            agent_middleware=agent_middleware_active,
             template_observability=template_observability,
         )
         resolved_session_id: str | None = None
@@ -32497,7 +32655,8 @@ def create_app(state: ServerState) -> FastAPI:
                 "refused": _vision_restore_refusal,
             }
         if (
-            not background
+            agent_middleware_active
+            and not background
             and not cache_bypass
             and (vision_session_restore is None or vision_session_restore["enabled"])
             and not aime_visible_working
@@ -33226,6 +33385,7 @@ def create_app(state: ServerState) -> FastAPI:
                 reasoning_effort=reasoning_effort,
                 tool_specs=postcommit_tool_specs,
                 tool_prompt_mode=postcommit_tool_prompt_mode,
+                agent_middleware=agent_middleware_active,
                 strip_tool_call_preamble_text=strip_tool_call_preamble_text,
                 session=session,
             )
@@ -33298,6 +33458,7 @@ def create_app(state: ServerState) -> FastAPI:
                         expected_session_revision=getattr(session, "revision", None),
                         keep_live_ref=session_keep_live_ref,
                         tool_prompt_mode=postcommit_tool_prompt_mode,
+                        agent_middleware=agent_middleware_active,
                         strip_tool_call_preamble_text=strip_tool_call_preamble_text,
                         committed_stream_ids=postcommit_committed_stream,
                     )
@@ -33318,6 +33479,7 @@ def create_app(state: ServerState) -> FastAPI:
                         tool_specs=postcommit_tool_specs,
                         keep_live_ref=session_keep_live_ref,
                         tool_prompt_mode=postcommit_tool_prompt_mode,
+                        agent_middleware=agent_middleware_active,
                         strip_tool_call_preamble_text=strip_tool_call_preamble_text,
                         committed_stream_ids=postcommit_committed_stream,
                     ),
@@ -33616,7 +33778,8 @@ def create_app(state: ServerState) -> FastAPI:
                     generated: dict[str, Any],
                 ) -> dict[str, Any]:
                     if (
-                        not tools_active
+                        not agent_middleware_active
+                        or not tools_active
                         or not read_only_inspection_request
                         or not tool_result_history_present
                         or request.seed is not None
@@ -33711,7 +33874,8 @@ def create_app(state: ServerState) -> FastAPI:
                     generated: dict[str, Any],
                 ) -> dict[str, Any]:
                     if (
-                        not tools_active
+                        not agent_middleware_active
+                        or not tools_active
                         or read_only_inspection_request
                         or not tool_result_history_present
                         or request.seed is not None
@@ -33884,7 +34048,9 @@ def create_app(state: ServerState) -> FastAPI:
                     # covers both (user reports: "model responds but produces
                     # no answer", 27B + Flash-Next, chat and API).
                     if (
-                        not tools_active
+                        not agent_middleware_active
+                        or not tools_active
+                        or not tool_result_history_present
                         or not thinking_enabled
                         or request.seed is not None
                         or _reasoning_parser_for_state(state)
@@ -34071,7 +34237,8 @@ def create_app(state: ServerState) -> FastAPI:
                     generated: dict[str, Any],
                 ) -> dict[str, Any]:
                     if (
-                        not tools_active
+                        not agent_middleware_active
+                        or not tools_active
                         or not tool_result_history_present
                         or request.seed is not None
                     ):
@@ -34247,7 +34414,8 @@ def create_app(state: ServerState) -> FastAPI:
                     generated: dict[str, Any],
                 ) -> dict[str, Any]:
                     if (
-                        not read_only_force_answer_contract_active
+                        not agent_middleware_active
+                        or not read_only_force_answer_contract_active
                         or request.seed is not None
                     ):
                         return generated
@@ -34567,6 +34735,7 @@ def create_app(state: ServerState) -> FastAPI:
                                                 tool_specs=postcommit_tool_specs,
                                                 keep_live_ref=session_keep_live_ref,
                                                 tool_prompt_mode=postcommit_tool_prompt_mode,
+                                                agent_middleware=agent_middleware_active,
                                                 strip_tool_call_preamble_text=strip_tool_call_preamble_text,
                                                 committed_stream_ids=(
                                                     stream_committed_stream
@@ -34600,6 +34769,7 @@ def create_app(state: ServerState) -> FastAPI:
                                             tool_specs=postcommit_tool_specs,
                                             keep_live_ref=session_keep_live_ref,
                                             tool_prompt_mode=postcommit_tool_prompt_mode,
+                                            agent_middleware=agent_middleware_active,
                                             strip_tool_call_preamble_text=strip_tool_call_preamble_text,
                                         )
                                         generated["stats"][
@@ -34637,6 +34807,7 @@ def create_app(state: ServerState) -> FastAPI:
                                                     tool_specs=postcommit_tool_specs,
                                                     keep_live_ref=session_keep_live_ref,
                                                     tool_prompt_mode=postcommit_tool_prompt_mode,
+                                                    agent_middleware=agent_middleware_active,
                                                     strip_tool_call_preamble_text=strip_tool_call_preamble_text,
                                                 )
                                             ),
@@ -35744,13 +35915,15 @@ def create_app(state: ServerState) -> FastAPI:
                                     defer_content_resolution=True,
                                 ):
                                     yield mark_sse_sent(chunk)
-                            raw_generated_text = (
-                                _strip_mtplx_internal_continuation_markers(
-                                    _strip_generated_chat_template_sentinels(
-                                        str(generated.get("text") or "")
+                            raw_generated_text = _strip_generated_chat_template_sentinels(
+                                str(generated.get("text") or "")
+                            )
+                            if agent_middleware_active:
+                                raw_generated_text = (
+                                    _strip_mtplx_internal_continuation_markers(
+                                        raw_generated_text
                                     )
                                 )
-                            )
                             raw_reasoning_text, raw_content_text = (
                                 _tool_extraction_text_parts(
                                     state,
@@ -36266,6 +36439,7 @@ def create_app(state: ServerState) -> FastAPI:
                                             ),
                                             keep_live_ref=session_keep_live_ref,
                                             tool_prompt_mode=postcommit_tool_prompt_mode,
+                                            agent_middleware=agent_middleware_active,
                                             strip_tool_call_preamble_text=strip_tool_call_preamble_text,
                                             committed_stream_ids=[
                                                 int(token) for token in prompt_ids
@@ -36774,11 +36948,11 @@ def create_app(state: ServerState) -> FastAPI:
         generated["stats"]["hidden_generation_repair_used"] = False
         generated["stats"]["early_tool_cancel_used"] = False
         if tools_active:
-            raw_text = _strip_mtplx_internal_continuation_markers(
-                _strip_generated_chat_template_sentinels(
-                    str(generated.get("text") or "")
-                )
+            raw_text = _strip_generated_chat_template_sentinels(
+                str(generated.get("text") or "")
             )
+            if agent_middleware_active:
+                raw_text = _strip_mtplx_internal_continuation_markers(raw_text)
             raw_reasoning_text, raw_content_text = _tool_extraction_text_parts(
                 state,
                 raw_text,
@@ -36856,7 +37030,10 @@ def create_app(state: ServerState) -> FastAPI:
                     extraction.cleaned_text,
                     state.runtime.tokenizer,
                 )
-                display_text = _strip_mtplx_internal_continuation_markers(display_text)
+                if agent_middleware_active:
+                    display_text = _strip_mtplx_internal_continuation_markers(
+                        display_text
+                    )
                 fallback_reason = extraction.malformed_reason or "malformed_tool_call"
                 fallback_kind = _tool_parse_counter_key(fallback_reason)
                 if fallback_kind == "unknown_tool_name":
@@ -36902,6 +37079,7 @@ def create_app(state: ServerState) -> FastAPI:
                         and not tools_active
                     ),
                     suppress_stats_footer=request.suppress_stats_footer,
+                    strip_mtplx_internal_markers=agent_middleware_active,
                 )
                 if extraction is None:
                     # No tools were declared on this request, so any tool-call
@@ -37099,9 +37277,10 @@ def create_app(state: ServerState) -> FastAPI:
             strip_assistant_reasoning_history=state.args.strip_assistant_reasoning_history,
             scoped_reasoning_history=_reasoning_history_scoped_active(state),
             preserve_reasoning_history=_reasoning_history_preserve_echo_active(state),
-            tools=policy.prompt_tool_specs,
+            tools=(policy.prompt_tool_specs if policy.agent_middleware_active else policy.model_tool_specs) or None,
             tool_choice=chat_request.tool_choice,
             tool_prompt_mode=policy.tool_prompt_mode,
+            agent_middleware=policy.agent_middleware_active,
         )
         return {"input_tokens": len(prompt_ids)}
 
@@ -38678,6 +38857,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Tool prompt contract mode. native passes tools only to the model "
             "chat template; hybrid keeps the legacy MTPLX contract for rollback."
+        ),
+    )
+    parser.add_argument(
+        "--agent-middleware",
+        choices=sorted(_AGENT_MIDDLEWARE_MODES),
+        default=os.environ.get("MTPLX_AGENT_MIDDLEWARE", _AGENT_MIDDLEWARE_ON),
+        help=(
+            "Agent transcript and prompt middleware. on preserves MTPLX's "
+            "legacy tool contracts and rewrites; off forwards OpenAI messages "
+            "and native tool schemas without MTPLX prompt injection."
         ),
     )
     parser.add_argument(

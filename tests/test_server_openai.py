@@ -2043,6 +2043,15 @@ def _fake_streaming_session_state():
     return state
 
 
+def test_server_parser_exposes_agent_middleware_switch():
+    assert parse_args(["--warmup-tokens", "0"]).agent_middleware == "on"
+    assert (
+        parse_args(["--warmup-tokens", "0", "--agent-middleware", "off"])
+        .agent_middleware
+        == "off"
+    )
+
+
 def _fake_final_state(tokens):
     return SimpleNamespace(
         final_trunk_cache=["cache"],
@@ -3414,6 +3423,119 @@ def test_opencode_chitchat_history_reaches_model_with_tools_kept(legacy_rewrites
     assert "MTPLX tool contract:" in rendered_text
     assert "session_status()" in rendered_text
     assert "How are you?" in rendered_text
+
+
+def test_agent_middleware_off_bypasses_policy_rewrites_and_preserves_task(
+    monkeypatch,
+):
+    captured: dict[str, object] = {}
+    state = _fake_state()
+    state.args.agent_middleware = "off"
+    state.args.stats_footer = False
+    state.runtime.tokenizer = CaptureTokenizer()
+    client = TestClient(create_app(state))
+
+    def forbidden_canonicalization(*_args, **_kwargs):
+        pytest.fail("transparent mode must not canonicalize the transcript")
+
+    def forbidden_backend_policy(*_args, **_kwargs):
+        pytest.fail("transparent mode must not inject a backend chat policy")
+
+    def fake_run_generation(_state, _prompt_ids, **kwargs):
+        captured.update(kwargs)
+        return {
+            "text": "ok",
+            "tokens": [4],
+            "stats": {
+                **kwargs["request_observability"],
+                "generation_mode": "ar",
+                "mtp_depth": 0,
+                "completion_tokens": 1,
+            },
+            "prompt_tokens": 3,
+            "completion_tokens": 1,
+            "finish_reason": "stop",
+        }
+
+    monkeypatch.setattr(openai, "_canonicalize_agent_transcript", forbidden_canonicalization)
+    monkeypatch.setattr(openai, "_with_backend_chat_policy", forbidden_backend_policy)
+    monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+
+    def long_tool(name: str) -> dict[str, object]:
+        return {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": "long schema " * 120,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "payload": {"type": "string", "description": "x" * 400}
+                    },
+                    "required": ["payload"],
+                },
+            },
+        }
+
+    tools = [long_tool(f"tool_{index}") for index in range(42)]
+    tools.append(long_tool("task"))
+    tool_output = "uncompacted tool result\n" * 4_000
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass", "x-mtplx-client": "opencode"},
+        json={
+            "messages": [
+                {"role": "system", "content": "OpenCode system message"},
+                {"role": "developer", "content": "OpenCode developer message"},
+                {"role": "user", "content": "Use the task tool"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_task",
+                            "type": "function",
+                            "function": {
+                                "name": "task",
+                                "arguments": '{"subagent_type":"explore"}',
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_task",
+                    "content": tool_output,
+                },
+            ],
+            "tools": tools,
+            "tool_choice": "auto",
+            "max_tokens": 8,
+        },
+    )
+
+    assert response.status_code == 200
+    assert client.get("/health").json()["startup"]["agent_middleware"] == "off"
+    rendered_messages, template_kwargs = state.runtime.tokenizer.calls[-1]
+    rendered_content = "\n".join(
+        str(message.get("content") or "") for message in rendered_messages
+    )
+    assert [message["role"] for message in rendered_messages] == [
+        "system",
+        "system",
+        "user",
+        "assistant",
+        "tool",
+    ]
+    assert rendered_messages[-1]["content"] == tool_output
+    assert template_kwargs["tools"] == tools
+    assert template_kwargs["tools"][-1]["function"]["name"] == "task"
+    assert "MTPLX " not in rendered_content
+    assert "<mtplx_compacted_" not in rendered_content
+    stats = captured["request_observability"]
+    assert stats["agent_middleware"] == "off"
+    assert stats["tool_prompt_mode"] == "native"
+    assert response.json()["mtplx_stats"]["agent_middleware"] == "off"
 
 
 def test_opencode_initial_coding_request_uses_compact_mtplx_agent_prompt(monkeypatch):
@@ -5608,6 +5730,36 @@ def test_tool_template_schema_failure_retries_with_compact_contract(legacy_rewri
     assert first_messages == second_messages
     assert "MTPLX tool contract:" in second_messages[0]["content"]
     assert "emit one declared <tool_call> now" in second_messages[0]["content"]
+
+
+def test_transparent_agent_middleware_fails_instead_of_dropping_native_tools(
+    monkeypatch,
+):
+    state = _fake_state()
+    state.args.agent_middleware = "off"
+    state.runtime.tokenizer = ToolSchemaRejectingTokenizer()
+    client = TestClient(create_app(state))
+    monkeypatch.setattr(
+        openai,
+        "_run_generation",
+        lambda *_args, **_kwargs: pytest.fail("encoding must reject first"),
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass", "x-mtplx-client": "opencode"},
+        json={
+            "messages": [{"role": "user", "content": "Use task."}],
+            "tools": [_tool_schema()],
+            "tool_choice": "auto",
+            "max_tokens": 8,
+        },
+    )
+
+    assert response.status_code == 500
+    assert "does not support native tools" in response.json()["error"]["message"]
+    assert state.runtime.tokenizer.calls
+    assert all("tools" in kwargs for _messages, kwargs in state.runtime.tokenizer.calls)
 
 
 def test_chat_tools_honor_explicit_disable_thinking_with_client_opt_in(monkeypatch):
@@ -8608,6 +8760,55 @@ def test_native_tool_prompt_mode_keeps_template_tools_and_adds_agent_tail(legacy
     assert observability["native_agent_tail_contract_active"] is True
 
 
+def test_transparent_agent_middleware_preserves_full_tool_inventory_without_injections():
+    tokenizer = CaptureTokenizer()
+
+    def long_tool(name: str) -> dict[str, object]:
+        return {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": "long schema " * 120,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "payload": {"type": "string", "description": "x" * 400},
+                    },
+                    "required": ["payload"],
+                },
+            },
+        }
+
+    tools = [long_tool(f"tool_{index}") for index in range(42)]
+    tools.append(long_tool("task"))
+    tool_output = "line\n" * 4_000
+
+    openai._encode_messages(
+        tokenizer,
+        [
+            openai.ChatMessage(role="system", content="OpenCode system message"),
+            openai.ChatMessage(role="developer", content="OpenCode developer message"),
+            openai.ChatMessage(role="user", content="Use task now"),
+            openai.ChatMessage(role="tool", tool_call_id="call_1", content=tool_output),
+        ],
+        enable_thinking=True,
+        add_generation_prompt=True,
+        tools=tools,
+        tool_prompt_mode="compact",
+        agent_middleware=False,
+    )
+
+    messages, kwargs = tokenizer.calls[-1]
+    rendered_content = "\n".join(
+        str(message.get("content") or "") for message in messages
+    )
+    assert kwargs["tools"] == tools
+    assert kwargs["tools"][-1]["function"]["name"] == "task"
+    assert messages[-1]["content"] == tool_output
+    assert "MTPLX " not in rendered_content
+    assert "<mtplx_compacted_" not in rendered_content
+
+
 def test_native_tool_prompt_mode_suppresses_agent_tail_for_chitchat():
     tokenizer = CaptureTokenizer()
     observability: dict[str, object] = {}
@@ -8737,6 +8938,50 @@ def test_compact_tool_prompt_mode_omits_native_template_tools(legacy_rewrites):
         "bash(command:string, description:string, timeout?:number)" in rendered_content
     )
     assert "read()" in rendered_content
+
+
+def test_compact_tool_contract_keeps_a_late_task_tool_in_the_allowlist():
+    tokenizer = CaptureTokenizer()
+
+    def long_tool(name: str) -> dict[str, object]:
+        return {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": "long schema " * 120,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        f"payload_{index}": {"type": "string"}
+                        for index in range(12)
+                    },
+                    "required": [f"payload_{index}" for index in range(12)],
+                },
+            },
+        }
+
+    tools = [long_tool(f"tool_{index}") for index in range(42)]
+    tools.append(long_tool("task"))
+
+    contract = openai._mtplx_tool_contract_text(tools)
+
+    assert "task(payload_0:string" in contract
+    assert "tool_0(payload_0:string" in contract
+
+    openai._encode_messages(
+        tokenizer,
+        [openai.ChatMessage(role="user", content="Use task")],
+        enable_thinking=True,
+        add_generation_prompt=True,
+        tools=tools,
+        tool_prompt_mode="compact",
+    )
+    messages, kwargs = tokenizer.calls[-1]
+    rendered_content = "\n".join(
+        str(message.get("content") or "") for message in messages
+    )
+    assert "tools" not in kwargs
+    assert "task(payload_0:string" in rendered_content
 
 
 def test_compact_tool_prompt_mode_still_validates_real_tool_schema():
