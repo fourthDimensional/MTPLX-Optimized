@@ -68,9 +68,11 @@ class RequestPolicy:
     opencode_client: bool = False
     requested_tool_specs: list[dict[str, Any]] = field(default_factory=list)
     tool_specs: list[dict[str, Any]] = field(default_factory=list)
+    model_tool_specs: list[dict[str, Any]] = field(default_factory=list)
     tools_active: bool = False
     agent_transcript_tools_active: bool = False
     postcommit_tool_specs: list[dict[str, Any]] | None = None
+    agent_middleware_active: bool = True
 
     # Prompt contracts.
     read_only_force_answer_contract_active: bool = False
@@ -422,8 +424,9 @@ def resolve_request_policy(
     observability: dict[str, Any] = {}
 
     opencode_client = srv._is_opencode_client(headers=headers, metadata=metadata)
+    agent_middleware_active = srv._agent_middleware_enabled_from_args(state.args)
     requested_tool_specs = srv._normalize_tool_specs(request.tools)
-    if chat:
+    if chat and agent_middleware_active:
         tool_specs = srv._filter_tool_specs_for_request(
             requested_tool_specs,
             request.messages,
@@ -454,7 +457,8 @@ def resolve_request_policy(
         )
     )
     read_only_force_answer_contract_active = bool(
-        chat
+        agent_middleware_active
+        and chat
         and srv._request_should_force_answer_for_read_only_inspection(request.messages)
     )
     if read_only_force_answer_contract_active:
@@ -479,7 +483,8 @@ def resolve_request_policy(
             # prefix stability owns the toolset bytes.
             pass
     no_tools_contract_applies = bool(
-        chat
+        agent_middleware_active
+        and chat
         and not read_only_force_answer_contract_active
         and srv._should_add_no_tool_contract(
             requested_tools=requested_tool_specs,
@@ -500,7 +505,8 @@ def resolve_request_policy(
     )
     client_controls_allowed = srv._client_controls_allowed(headers, metadata)
     pi_convergence_contract_active = bool(
-        chat
+        agent_middleware_active
+        and chat
         and not read_only_force_answer_contract_active
         and not no_tools_contract_active
         and not post_tool_answer_contract_active
@@ -518,7 +524,7 @@ def resolve_request_policy(
             metadata=metadata,
             tool_choice=request.tool_choice,
         )
-        if chat
+        if chat and agent_middleware_active
         else None
     )
     opencode_prompt_contract_system_prompt = (
@@ -527,7 +533,12 @@ def resolve_request_policy(
         else None
     )
     opencode_simple_chat_contract_active = False
-    if chat:
+    if not agent_middleware_active:
+        messages_for_generation, transcript_stats = srv._passthrough_agent_transcript(
+            request.messages
+        )
+        backend_chat_policy_active = False
+    elif chat:
         messages_for_generation, transcript_stats = srv._canonicalize_agent_transcript(
             request.messages,
             tools_active=agent_transcript_tools_active,
@@ -535,18 +546,24 @@ def resolve_request_policy(
             initial_client_system_prompt=opencode_prompt_contract_system_prompt,
             strip_tool_call_preamble_text=opencode_client,
         )
+        messages_for_generation, backend_chat_policy_active = (
+            srv._with_backend_chat_policy(
+                state,
+                messages_for_generation,
+            )
+        )
     else:
         messages_for_generation, transcript_stats = srv._canonicalize_agent_transcript(
             request.messages,
             tools_active=tools_active,
         )
-    messages_for_generation, backend_chat_policy_active = (
-        srv._with_backend_chat_policy(
-            state,
-            messages_for_generation,
+        messages_for_generation, backend_chat_policy_active = (
+            srv._with_backend_chat_policy(
+                state,
+                messages_for_generation,
+            )
         )
-    )
-    if chat:
+    if chat and agent_middleware_active:
         if read_only_force_answer_contract_active:
             messages_for_generation = (
                 srv._with_mtplx_read_only_force_answer_contract(
@@ -566,7 +583,8 @@ def resolve_request_policy(
                 messages_for_generation
             )
     read_only_inspection_request = bool(
-        chat
+        agent_middleware_active
+        and chat
         and srv._is_read_only_inspection_request(
             srv._last_user_text(messages_for_generation)
         )
@@ -576,7 +594,7 @@ def resolve_request_policy(
     )
     raw_messages_for_postcommit = (
         list(request.messages)
-        if read_only_force_answer_contract_active
+        if not agent_middleware_active or read_only_force_answer_contract_active
         else (
             list(messages_for_generation)
             if (
@@ -589,10 +607,19 @@ def resolve_request_policy(
             else list(request.messages)
         )
     )
+    model_tool_specs = (
+        requested_tool_specs
+        if not agent_middleware_active
+        else (tool_specs if tools_active else [])
+    )
     postcommit_tool_specs = (
-        tool_specs
-        if tools_active
-        else (requested_tool_specs if agent_transcript_tools_active else None)
+        requested_tool_specs
+        if not agent_middleware_active
+        else (
+            tool_specs
+            if tools_active
+            else (requested_tool_specs if agent_transcript_tools_active else None)
+        )
     )
     background = bool(
         chat
@@ -632,13 +659,25 @@ def resolve_request_policy(
         and thinking_enabled
         and srv._reasoning_parser_for_state(state) in {"qwen3", "step3p5"}
     )
-    tool_prompt_mode, tool_prompt_mode_resolution = srv._tool_prompt_mode_for_request(
-        state.args,
-        headers=headers,
-        metadata=metadata,
-        tools_active=tools_active,
-        backend=srv._backend_descriptor(state),
-    )
+    if agent_middleware_active:
+        tool_prompt_mode, tool_prompt_mode_resolution = (
+            srv._tool_prompt_mode_for_request(
+                state.args,
+                headers=headers,
+                metadata=metadata,
+                tools_active=tools_active,
+                backend=srv._backend_descriptor(state),
+            )
+        )
+    else:
+        tool_prompt_mode = srv._TOOL_PROMPT_MODE_NATIVE
+        tool_prompt_mode_resolution = {
+            "tool_prompt_mode_launch": srv._tool_prompt_mode_from_args(state.args),
+            "tool_prompt_mode_source": "agent_middleware:off",
+            "tool_prompt_mode_client": None,
+            "tool_prompt_mode_request_override": None,
+            "tool_prompt_mode_client_repaired": False,
+        }
     template_tool_prompt_mode = tool_prompt_mode
     if chat and read_only_force_answer_contract_active and tools_active:
         # Read-budget force-answer turns keep the SAME template mode as
@@ -654,7 +693,7 @@ def resolve_request_policy(
             "tool_prompt_mode_source": "read_only_force_answer_prefix_stable",
         }
     postcommit_tool_prompt_mode = tool_prompt_mode
-    if chat and postcommit_tool_specs and not tools_active:
+    if chat and agent_middleware_active and postcommit_tool_specs and not tools_active:
         postcommit_tool_prompt_mode, _ = srv._tool_prompt_mode_for_request(
             state.args,
             headers=headers,
@@ -668,9 +707,11 @@ def resolve_request_policy(
             opencode_client=opencode_client,
             requested_tool_specs=requested_tool_specs,
             tool_specs=tool_specs,
+            model_tool_specs=model_tool_specs,
             tools_active=tools_active,
             agent_transcript_tools_active=agent_transcript_tools_active,
             postcommit_tool_specs=postcommit_tool_specs,
+            agent_middleware_active=agent_middleware_active,
             backend_chat_policy_active=backend_chat_policy_active,
             messages_for_generation=messages_for_generation,
             transcript_stats=transcript_stats,
@@ -739,6 +780,8 @@ def resolve_request_policy(
         observability=observability,
     )
     observability["request_reasoning_parser"] = srv._reasoning_parser_for_state(state)
+    if not agent_middleware_active:
+        observability["agent_middleware"] = "off"
     observability["request_read_only_inspection_force_answer"] = bool(
         read_only_force_answer_contract_active
     )
@@ -843,9 +886,11 @@ def resolve_request_policy(
         opencode_client=opencode_client,
         requested_tool_specs=requested_tool_specs,
         tool_specs=tool_specs,
+        model_tool_specs=model_tool_specs,
         tools_active=tools_active,
         agent_transcript_tools_active=agent_transcript_tools_active,
         postcommit_tool_specs=postcommit_tool_specs,
+        agent_middleware_active=agent_middleware_active,
         read_only_force_answer_contract_active=read_only_force_answer_contract_active,
         no_tools_contract_active=no_tools_contract_active,
         post_tool_answer_contract_active=post_tool_answer_contract_active,
