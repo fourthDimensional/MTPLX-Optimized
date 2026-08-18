@@ -677,8 +677,13 @@ def resolve_request_policy(
             prompt_tool_specs if prompt_tool_specs else (requested_tool_specs if agent_transcript_tools_active else None)
         )
     )
+    # The short-request/system-mismatch detector is an MTPLX scheduling
+    # policy, not an OpenAI protocol field.  Transparent callers own their
+    # history, so it must not turn an ordinary short tool turn into a hidden
+    # background/cache-bypass request.
     background = bool(
         chat
+        and agent_middleware_active
         and srv.is_background_request(
             messages=messages_for_generation,
             max_tokens=srv._request_max_tokens(request),

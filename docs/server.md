@@ -349,7 +349,13 @@ It does not canonicalize or compact the transcript, replace the tool inventory
 with a text contract, or inject MTPLX agent prompts and retry reminders. If a
 selected template cannot render native tools, the request fails explicitly
 instead of silently dropping them. Session-bank postcommit rewriting and its
-cache reuse are intentionally disabled in transparent mode.
+history-reconstruction cache reuse are disabled in transparent mode. For long
+text prompts, MTPLX does retain a clone-only KV snapshot at the exact rendered
+token boundary: a later request can reuse only the literal rendered-token
+prefix it shares with the new request, with matching model/template policy
+identity. This avoids a full re-prefill of an unchanged OpenCode prologue
+without rewriting, compacting, or approximating the client transcript. Image
+prompts currently cold-prefill in transparent mode.
 
 ### Transparent-mode reasoning effort
 

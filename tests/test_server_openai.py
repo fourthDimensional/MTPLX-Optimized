@@ -3434,6 +3434,10 @@ def test_agent_middleware_off_bypasses_policy_rewrites_and_preserves_task(
     state.args.stats_footer = False
     state.runtime.tokenizer = CaptureTokenizer()
     state.sessions.bank = RecordingBank()
+    # A legacy Open WebUI background-task detector sees a short request with
+    # a new system prompt as maintenance work. Transparent mode must not
+    # apply that agent-scheduling heuristic to the client's raw history.
+    state.main_system_prompt_hash = "a-different-client-system-prompt"
     # CaptureTokenizer uses a tiny fixed token sequence; lower only the
     # admission threshold so this endpoint test can exercise the otherwise
     # long-context exact-prefix cache path.
@@ -3560,7 +3564,10 @@ def test_agent_middleware_off_bypasses_policy_rewrites_and_preserves_task(
     assert stats["request_session_bank_bypass"] is False
     assert stats["transparent_exact_prefix_cache"] is True
     assert captured["session_bank"] is not state.sessions.bank
-    assert not hasattr(captured["session_bank"], "near_prefix_candidates")
+    assert callable(getattr(captured["session_bank"], "near_prefix_candidates"))
+    assert callable(
+        getattr(captured["session_bank"], "restore_entry_prefix_cache")
+    )
     assert captured["session_id"].startswith("transparent-prefix:")
     assert captured["commit_prompt_prefix_to_bank"] is True
     assert captured["commit_final_state_to_bank"] is False
