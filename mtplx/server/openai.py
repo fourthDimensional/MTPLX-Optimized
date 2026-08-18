@@ -16259,6 +16259,7 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "request_session_source",
     "session_cache_scope",
     "transparent_exact_prefix_cache",
+    "transparent_exact_prefix_cache_reason",
     "opencode_tool_history_cache_bypass",
     "opencode_tool_history_force_clone_restore",
     "opencode_tool_history_live_frontier_restore",
@@ -16774,16 +16775,16 @@ _TRANSPARENT_EXACT_PREFIX_CACHE_MIN_TOKENS = 512
 
 
 class _TransparentExactPrefixBank:
-    """Expose only literal-prefix KV reuse to transparent requests.
+    """Expose only literal rendered-token-prefix KV reuse transparently.
 
     ``SessionBank`` also offers near/block-prefix recovery for MTPLX-owned
-    agent transcripts.  That recovery is useful after canonicalization, but a
-    transparent request must never substitute a merely similar client
-    transcript.  This deliberately narrow view retains the safe operations:
-    exact-prefix lookup/restore and prompt-boundary snapshot storage.  In
-    particular, it does not expose ``near_prefix_candidates`` or
-    ``restore_entry_prefix_cache``, so ``restore_or_prefill_prompt_state``
-    cannot enter either reconstruction lane.
+    agent transcripts.  A transparent request may use only its *literal common
+    token prefix*: the exact rendered tokens shared by the stored prompt and
+    the new client prompt.  This is necessary for ordinary follow-up turns,
+    whose template generation suffix becomes assistant history on the next
+    request.  It never replaces, canonicalizes, or otherwise interprets a
+    client message; a divergence simply causes the remaining suffix to be
+    prefetched from the submitted request.
     """
 
     def __init__(self, bank: Any) -> None:
@@ -16797,6 +16798,32 @@ class _TransparentExactPrefixBank:
 
     def put(self, **kwargs: Any) -> Any:
         return self._bank.put(**kwargs)
+
+    def near_prefix_candidates(
+        self,
+        token_ids: list[int] | tuple[int, ...],
+        **kwargs: Any,
+    ) -> list[tuple[Any, int]]:
+        """Return only candidates whose reusable portion is byte-for-byte.
+
+        ``SessionBank`` calls this a near-prefix lane because the two complete
+        prompts diverge after the shared history.  The reusable prefix itself
+        is exact: retain an explicit check here so transparent mode cannot
+        inherit a future heuristic candidate implementation by accident.
+        """
+
+        candidates = self._bank.near_prefix_candidates(token_ids, **kwargs)
+        requested = tuple(int(token) for token in token_ids)
+        exact: list[tuple[Any, int]] = []
+        for entry, matched in candidates:
+            matched = max(0, int(matched))
+            entry_ids = tuple(int(token) for token in entry.token_ids[:matched])
+            if matched and requested[:matched] == entry_ids:
+                exact.append((entry, matched))
+        return exact
+
+    def restore_entry_prefix_cache(self, *args: Any, **kwargs: Any) -> Any:
+        return self._bank.restore_entry_prefix_cache(*args, **kwargs)
 
     @property
     def last_miss_reason(self) -> Any:
@@ -26403,13 +26430,22 @@ def create_app(state: ServerState) -> FastAPI:
         # prompts need content-keyed surrogate ids, which are computed later
         # in the vision path; falling back to a cold prefill is the safe
         # behavior until that identity is available at this boundary.
-        transparent_exact_prefix_cache = bool(
-            not agent_middleware_active
-            and not background
-            and not cache_bypass
-            and vision_splice is None
-            and len(prompt_ids) >= _TRANSPARENT_EXACT_PREFIX_CACHE_MIN_TOKENS
-            and getattr(state.sessions, "bank", None) is not None
+        if agent_middleware_active:
+            transparent_exact_prefix_cache_reason = "agent_middleware_on"
+        elif background:
+            transparent_exact_prefix_cache_reason = "background_request"
+        elif cache_bypass:
+            transparent_exact_prefix_cache_reason = "client_cache_bypass"
+        elif vision_splice is not None:
+            transparent_exact_prefix_cache_reason = "vision_request"
+        elif len(prompt_ids) < _TRANSPARENT_EXACT_PREFIX_CACHE_MIN_TOKENS:
+            transparent_exact_prefix_cache_reason = "prompt_below_512_tokens"
+        elif getattr(state.sessions, "bank", None) is None:
+            transparent_exact_prefix_cache_reason = "session_bank_unavailable"
+        else:
+            transparent_exact_prefix_cache_reason = "eligible"
+        transparent_exact_prefix_cache = (
+            transparent_exact_prefix_cache_reason == "eligible"
         )
         if transparent_exact_prefix_cache:
             session_cache_scope = _TRANSPARENT_EXACT_PREFIX_CACHE_SCOPE
@@ -26595,6 +26631,9 @@ def create_app(state: ServerState) -> FastAPI:
         request_observability["session_cache_scope"] = session_cache_scope
         request_observability["transparent_exact_prefix_cache"] = bool(
             transparent_exact_prefix_cache
+        )
+        request_observability["transparent_exact_prefix_cache_reason"] = (
+            transparent_exact_prefix_cache_reason
         )
         request_observability["opencode_tool_history_cache_bypass"] = bool(
             opencode_tool_history_cache_bypass
