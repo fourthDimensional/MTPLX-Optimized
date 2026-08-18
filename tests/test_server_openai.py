@@ -9042,6 +9042,22 @@ def test_froggeric_template_profile_applies_from_vendored_file():
     assert "<function=example_function_name>" in tokenizer.chat_template
 
 
+def test_froggeric_v22_template_profile_applies_reasoning_effort_template():
+    tokenizer = SimpleNamespace(chat_template="official")
+    args = SimpleNamespace(
+        chat_template_profile="froggeric_v22_1", chat_template_path=None
+    )
+
+    report = openai._apply_chat_template_profile(tokenizer, args)
+
+    assert report["profile"] == "froggeric_v22_1"
+    assert report["source"] == "file"
+    assert report["applied"] is True
+    assert 'template_version = "qwen3.8-froggeric-v22.1"' in tokenizer.chat_template
+    assert "<|think_xhigh|>" in tokenizer.chat_template
+    assert "<|think_low|>" in tokenizer.chat_template
+
+
 def test_tool_contract_suppresses_agent_tail_for_simple_chitchat():
     with_contract = openai._with_mtplx_tool_contract(
         [{"role": "user", "content": "hi how are you"}],
