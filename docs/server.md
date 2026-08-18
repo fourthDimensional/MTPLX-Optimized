@@ -104,14 +104,17 @@ example OpenCode with a Qwen template that supports native tools), start the
 forked server with:
 
 ```bash
-mtplx serve --host 127.0.0.1 --port 8006 --agent-middleware off
+mtplx serve --host 127.0.0.1 --port 8006 --agent-middleware off \
+  --chat-template-profile froggeric_v21_3
 ```
 
 In this mode MTPLX preserves the incoming system, developer, user, assistant,
 and tool history (with the protocol-required developer-to-system conversion for
 Qwen templates) and passes the complete incoming `tools` array to the native
-chat template. It does not canonicalize or compact the transcript, replace the
-tool inventory with a text contract, or inject MTPLX agent prompts and retry
-reminders. If a selected template cannot render native tools, the request fails
-explicitly instead of silently dropping them. Session-bank postcommit rewriting
-and its cache reuse are intentionally disabled in transparent mode.
+chat template. `froggeric_v21_3` is the bundled Qwen template with native tool
+support; a custom tokenizer template is also valid if it accepts `tools`. It
+does not canonicalize or compact the transcript, replace the tool inventory with
+a text contract, or inject MTPLX agent prompts and retry reminders. If a
+selected template cannot render native tools, the request fails explicitly
+instead of silently dropping them. Session-bank postcommit rewriting and its
+cache reuse are intentionally disabled in transparent mode.
