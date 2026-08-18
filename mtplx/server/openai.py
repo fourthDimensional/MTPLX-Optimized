@@ -4848,12 +4848,14 @@ _TOOL_PROMPT_MODE_REQUEST_HEADERS = (
 _CHAT_TEMPLATE_PROFILE_LOCAL = "local_qwen36"
 _CHAT_TEMPLATE_PROFILE_FROGGERIC = "froggeric_v19"
 _CHAT_TEMPLATE_PROFILE_FROGGERIC_V21 = "froggeric_v21_3"
+_CHAT_TEMPLATE_PROFILE_FROGGERIC_V22 = "froggeric_v22_1"
 _CHAT_TEMPLATE_PROFILE_CUSTOM = "custom"
 _CHAT_TEMPLATE_PROFILE_TOKENIZER = "tokenizer"
 _CHAT_TEMPLATE_PROFILES = {
     _CHAT_TEMPLATE_PROFILE_LOCAL,
     _CHAT_TEMPLATE_PROFILE_FROGGERIC,
     _CHAT_TEMPLATE_PROFILE_FROGGERIC_V21,
+    _CHAT_TEMPLATE_PROFILE_FROGGERIC_V22,
     _CHAT_TEMPLATE_PROFILE_TOKENIZER,
 }
 _TOOL_PARSE_COUNTER_KEYS = (
@@ -4982,6 +4984,10 @@ def _chat_template_profile_path(profile: str) -> Path | None:
         # Upstream froggeric/Qwen-Fixed-Chat-Templates v21.3 (2026-07-02),
         # vendored 2026-07-09 for A/B against local_qwen36. Opt-in only.
         return _PACKAGE_TEMPLATES / "qwen36_froggeric_v21_3" / "chat_template.jinja"
+    if profile == _CHAT_TEMPLATE_PROFILE_FROGGERIC_V22:
+        # Upstream froggeric/Qwen-Fixed-Chat-Templates v22.1, vendored for
+        # Qwen 3.8's low/medium/xhigh native reasoning controls.
+        return _PACKAGE_TEMPLATES / "qwen38_froggeric_v22_1" / "chat_template.jinja"
     return None
 
 
