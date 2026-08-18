@@ -10192,6 +10192,8 @@ def cmd_serve_public(args: Any) -> int:
         )
     if getattr(args, "tool_prompt_mode", None):
         cmd.extend(["--tool-prompt-mode", str(args.tool_prompt_mode)])
+    if getattr(args, "agent_middleware", None):
+        cmd.extend(["--agent-middleware", str(args.agent_middleware)])
     if getattr(args, "chat_template_profile", None):
         cmd.extend(["--chat-template-profile", str(args.chat_template_profile)])
     if getattr(args, "chat_template_path", None):
@@ -12547,6 +12549,9 @@ def _server_sampler_command_suffix(args: Any, *, include_draft: bool) -> str:
 
 def _bridge_prompt_command_suffix(args: Any) -> str:
     parts: list[str] = []
+    agent_middleware = getattr(args, "agent_middleware", None)
+    if agent_middleware:
+        parts.extend(["--agent-middleware", shlex.quote(str(agent_middleware))])
     tool_prompt_mode = getattr(args, "tool_prompt_mode", None)
     if tool_prompt_mode:
         parts.extend(["--tool-prompt-mode", shlex.quote(str(tool_prompt_mode))])
@@ -12861,6 +12866,7 @@ def _quickstart_opencode_payload(
         tuple(reasoning_policy.effort_levels) if reasoning_policy.supported else None
     )
     tool_prompt_mode = _inspection_tool_prompt_mode(args, inspection)
+    agent_middleware = str(getattr(args, "agent_middleware", "on") or "on")
     chat_template_profile = str(
         getattr(args, "chat_template_profile", OPENCODE_CHAT_TEMPLATE_PROFILE_DEFAULT)
         or OPENCODE_CHAT_TEMPLATE_PROFILE_DEFAULT
@@ -12945,6 +12951,7 @@ def _quickstart_opencode_payload(
         "reasoning_effort": reasoning_effort,
         "no_hidden_max_tokens": True,
         "tool_prompt_mode": tool_prompt_mode,
+        "agent_middleware": agent_middleware,
         "chat_template_profile": chat_template_profile,
         "mtp_depth": int(getattr(args, "depth", 3)),
         "target_sampler": target_sampler,
@@ -12970,6 +12977,7 @@ def _quickstart_opencode_payload(
             f"{sampler_suffix}"
             f"{draft_sampler_suffix}"
             f"{max_response_suffix}"
+            f"--agent-middleware {agent_middleware} "
             f"--tool-prompt-mode {tool_prompt_mode} "
             f"--chat-template-profile {chat_template_profile} "
             f"--reasoning {reasoning_mode} "
@@ -13442,6 +13450,7 @@ def _with_server_policy_args(target: Any, source: Any) -> Any:
         ("retrieval_trust_remote_code", False),
         ("api_key_file", None),
         ("api_key_source", "none"),
+        ("agent_middleware", "on"),
         ("default_presence_penalty", 0.0),
         ("default_frequency_penalty", 0.0),
         ("paged_kv_quantization", "off"),

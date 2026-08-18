@@ -323,3 +323,23 @@ and OpenCode never receive it, so no flag is needed for them.
 `--no-stats-footer` still turns it off everywhere, and
 `MTPLX_STATS_FOOTER_SCOPE=all` restores the pre-2.5.3 behavior. Metrics
 remain available at `/metrics`.
+
+## Transparent agent middleware
+
+Agent middleware is enabled by default for compatibility with existing MTPLX
+agent integrations. For a transparent OpenAI-compatible agent bridge (for
+example OpenCode with a Qwen template that supports native tools), start the
+forked server with:
+
+```bash
+mtplx serve --host 127.0.0.1 --port 8006 --agent-middleware off
+```
+
+In this mode MTPLX preserves the incoming system, developer, user, assistant,
+and tool history (with the protocol-required developer-to-system conversion for
+Qwen templates) and passes the complete incoming `tools` array to the native
+chat template. It does not canonicalize or compact the transcript, replace the
+tool inventory with a text contract, or inject MTPLX agent prompts and retry
+reminders. If a selected template cannot render native tools, the request fails
+explicitly instead of silently dropping them. Session-bank postcommit rewriting
+and its cache reuse are intentionally disabled in transparent mode.
