@@ -16257,6 +16257,8 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "read_only_force_answer_visible_prefix_stripped_chars",
     "read_only_force_answer_visible_tokens",
     "request_session_source",
+    "session_cache_scope",
+    "transparent_exact_prefix_cache",
     "opencode_tool_history_cache_bypass",
     "opencode_tool_history_force_clone_restore",
     "opencode_tool_history_live_frontier_restore",
@@ -16305,6 +16307,7 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "request_session_keep_live_ref",
     "request_session_keep_live_ref_reason",
     "request_session_bank_bypass",
+    "request_commit_prompt_prefix",
     "request_session_prefix_diagnostic",
     "live_frontier_candidate",
     "live_frontier_result_turn",
@@ -16764,6 +16767,57 @@ def _session_cache_scope_for_request(
     if not launch_id:
         launch_id = f"pid:{os.getpid()}"
     return f"opencode_process_cache:v1:{launch_id}"
+
+
+_TRANSPARENT_EXACT_PREFIX_CACHE_SCOPE = "transparent_exact_prefix:v1"
+_TRANSPARENT_EXACT_PREFIX_CACHE_MIN_TOKENS = 512
+
+
+class _TransparentExactPrefixBank:
+    """Expose only literal-prefix KV reuse to transparent requests.
+
+    ``SessionBank`` also offers near/block-prefix recovery for MTPLX-owned
+    agent transcripts.  That recovery is useful after canonicalization, but a
+    transparent request must never substitute a merely similar client
+    transcript.  This deliberately narrow view retains the safe operations:
+    exact-prefix lookup/restore and prompt-boundary snapshot storage.  In
+    particular, it does not expose ``near_prefix_candidates`` or
+    ``restore_entry_prefix_cache``, so ``restore_or_prefill_prompt_state``
+    cannot enter either reconstruction lane.
+    """
+
+    def __init__(self, bank: Any) -> None:
+        self._bank = bank
+
+    def longest_prefix(self, token_ids: list[int] | tuple[int, ...]) -> Any:
+        return self._bank.longest_prefix(token_ids)
+
+    def restore(self, *args: Any, **kwargs: Any) -> Any:
+        return self._bank.restore(*args, **kwargs)
+
+    def put(self, **kwargs: Any) -> Any:
+        return self._bank.put(**kwargs)
+
+    @property
+    def last_miss_reason(self) -> Any:
+        return getattr(self._bank, "last_miss_reason", None)
+
+
+def _transparent_exact_prefix_cache_owner_id(prompt_ids: list[int]) -> str:
+    """Return an opaque, stable retention owner for transparent KV entries.
+
+    The owner is not a client session id and is never returned to clients.  It
+    only lets SessionBank apply its existing retention accounting to prompts
+    that share a long rendered prologue.  Restore eligibility remains the
+    full literal token prefix plus the usual model/template/policy identity
+    checks.
+    """
+
+    anchor = ",".join(
+        str(int(token))
+        for token in prompt_ids[:_TRANSPARENT_EXACT_PREFIX_CACHE_MIN_TOKENS]
+    )
+    return f"transparent-prefix:{hash_text(anchor)}"
 
 
 def _is_opencode_client(
@@ -26345,6 +26399,20 @@ def create_app(state: ServerState) -> FastAPI:
             if agent_middleware_active
             else "transparent_bypass"
         )
+        # Transparent-mode reuse is deliberately text-only for now.  Image
+        # prompts need content-keyed surrogate ids, which are computed later
+        # in the vision path; falling back to a cold prefill is the safe
+        # behavior until that identity is available at this boundary.
+        transparent_exact_prefix_cache = bool(
+            not agent_middleware_active
+            and not background
+            and not cache_bypass
+            and vision_splice is None
+            and len(prompt_ids) >= _TRANSPARENT_EXACT_PREFIX_CACHE_MIN_TOKENS
+            and getattr(state.sessions, "bank", None) is not None
+        )
+        if transparent_exact_prefix_cache:
+            session_cache_scope = _TRANSPARENT_EXACT_PREFIX_CACHE_SCOPE
         policy_fingerprint = _policy_fingerprint(
             state,
             thinking_enabled=thinking_enabled,
@@ -26509,6 +26577,14 @@ def create_app(state: ServerState) -> FastAPI:
             session = state.sessions.get_or_create(session_id)
             session.last_cache_miss_reason = cache_miss_reason
             session.last_restore_mode = session_restore_mode
+        elif transparent_exact_prefix_cache:
+            # Do not resolve/create an EngineSession in transparent mode.  A
+            # prompt-boundary cache snapshot is safe because it is keyed by
+            # the full rendered token sequence; the opaque owner only scopes
+            # normal SessionBank retention accounting.
+            session_id = _transparent_exact_prefix_cache_owner_id(prompt_ids)
+            session_source = "transparent_exact_prefix"
+            session_restore_mode = "clone"
         if requested_model:
             request_observability["request_model"] = requested_model
             request_observability["served_model_id"] = state.model_id
@@ -26517,6 +26593,9 @@ def create_app(state: ServerState) -> FastAPI:
             )
         request_observability.update(policy.as_observability())
         request_observability["session_cache_scope"] = session_cache_scope
+        request_observability["transparent_exact_prefix_cache"] = bool(
+            transparent_exact_prefix_cache
+        )
         request_observability["opencode_tool_history_cache_bypass"] = bool(
             opencode_tool_history_cache_bypass
         )
@@ -26596,25 +26675,33 @@ def create_app(state: ServerState) -> FastAPI:
                 live_frontier_tool_result_ids - live_frontier_tool_call_ids
             )
         session_bank_for_generation = (
-            None
-            if not agent_middleware_active
-            or background
-            or cache_bypass
-            or opencode_tool_history_cache_bypass
-            or (vision_splice is not None and not vision_cache_keying)
-            else state.sessions.bank
+            _TransparentExactPrefixBank(state.sessions.bank)
+            if transparent_exact_prefix_cache
+            else (
+                None
+                if not agent_middleware_active
+                or background
+                or cache_bypass
+                or opencode_tool_history_cache_bypass
+                or (vision_splice is not None and not vision_cache_keying)
+                else state.sessions.bank
+            )
         )
         request_observability["request_session_bank_bypass"] = (
             session_bank_for_generation is None
         )
         commit_prompt_prefix = (
-            _commit_prompt_prefix_for_request(
-                state,
-                prompt_ids=prompt_ids,
-                tools_active=tools_active,
+            True
+            if transparent_exact_prefix_cache
+            else (
+                _commit_prompt_prefix_for_request(
+                    state,
+                    prompt_ids=prompt_ids,
+                    tools_active=tools_active,
+                )
+                if agent_middleware_active
+                else False
             )
-            if agent_middleware_active
-            else False
         )
         if read_only_force_answer_contract_active:
             # The forced-answer contract is a transient generation aid. OpenCode
@@ -26739,6 +26826,7 @@ def create_app(state: ServerState) -> FastAPI:
                         session_draft_head_identity=state.draft_head_identity,
                         session_policy_fingerprint=session_restore_policy_fingerprint,
                         background_request=background,
+                        commit_final_state_to_bank=not transparent_exact_prefix_cache,
                         commit_prompt_prefix_to_bank=commit_prompt_prefix,
                         session_keep_live_ref=session_keep_live_ref,
                         vision_splice=vision_splice,
@@ -27910,6 +27998,7 @@ def create_app(state: ServerState) -> FastAPI:
                                 session_draft_head_identity=state.draft_head_identity,
                                 session_policy_fingerprint=session_restore_policy_fingerprint,
                                 background_request=background,
+                                commit_final_state_to_bank=not transparent_exact_prefix_cache,
                                 commit_prompt_prefix_to_bank=commit_prompt_prefix,
                                 session_keep_live_ref=session_keep_live_ref,
                                 vision_splice=vision_splice,

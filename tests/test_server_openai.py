@@ -3041,6 +3041,11 @@ def test_agent_middleware_off_bypasses_policy_rewrites_and_preserves_task(
     state.args.agent_middleware = "off"
     state.args.stats_footer = False
     state.runtime.tokenizer = CaptureTokenizer()
+    state.sessions.bank = RecordingBank()
+    # CaptureTokenizer uses a tiny fixed token sequence; lower only the
+    # admission threshold so this endpoint test can exercise the otherwise
+    # long-context exact-prefix cache path.
+    monkeypatch.setattr(openai, "_TRANSPARENT_EXACT_PREFIX_CACHE_MIN_TOKENS", 1)
     state.sessions.resolve_session_id = lambda **_kwargs: pytest.fail(
         "transparent mode must not resolve a SessionBank session"
     )
@@ -3159,10 +3164,19 @@ def test_agent_middleware_off_bypasses_policy_rewrites_and_preserves_task(
     stats = captured["request_observability"]
     assert stats["agent_middleware"] == "off"
     assert stats["tool_prompt_mode"] == "native"
-    assert stats["session_cache_scope"] == "transparent_bypass"
-    assert stats["request_session_bank_bypass"] is True
-    assert captured["session_bank"] is None
-    assert response.json()["mtplx_stats"]["agent_middleware"] == "off"
+    assert stats["session_cache_scope"] == "transparent_exact_prefix:v1"
+    assert stats["request_session_bank_bypass"] is False
+    assert stats["transparent_exact_prefix_cache"] is True
+    assert captured["session_bank"] is not state.sessions.bank
+    assert not hasattr(captured["session_bank"], "near_prefix_candidates")
+    assert captured["session_id"].startswith("transparent-prefix:")
+    assert captured["commit_prompt_prefix_to_bank"] is True
+    assert captured["commit_final_state_to_bank"] is False
+    public_stats = response.json()["mtplx_stats"]
+    assert public_stats["agent_middleware"] == "off"
+    assert public_stats["session_cache_scope"] == "transparent_exact_prefix:v1"
+    assert public_stats["transparent_exact_prefix_cache"] is True
+    assert public_stats["request_session_bank_bypass"] is False
 
 
 def test_opencode_initial_coding_request_uses_compact_mtplx_agent_prompt(monkeypatch):
