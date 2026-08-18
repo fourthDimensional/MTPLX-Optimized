@@ -11015,9 +11015,11 @@ def _transparent_message_to_template_dict(
         item["tool_call_id"] = message.tool_call_id
     if message.tool_calls:
         item["tool_calls"] = [_template_tool_call(call) for call in message.tool_calls]
-    if content or role == "tool" or message.tool_calls:
-        return item
-    return None
+    # An empty OpenAI message is still a real transcript turn.  Do not use
+    # content truthiness as a proxy for whether the client sent it: native
+    # Qwen templates can distinguish an empty system/developer/user turn
+    # from its absence.
+    return item
 
 
 def _transparent_messages_for_template(
@@ -11118,6 +11120,7 @@ def _render_messages_with_chat_template(
     reasoning_effort: str | None,
     preserve_thinking: bool,
     tools: list[dict[str, Any]] | None,
+    allow_schema_free_tool_fallback: bool = True,
     template_observability: dict[str, Any] | None = None,
 ) -> str | None:
     template_kwargs: dict[str, Any] = {
@@ -11144,6 +11147,8 @@ def _render_messages_with_chat_template(
         except Exception:
             if not tools:
                 return None
+            if not allow_schema_free_tool_fallback:
+                return None
             try:
                 if template_observability is not None:
                     template_observability["tool_template_fallback"] = True
@@ -11156,6 +11161,8 @@ def _render_messages_with_chat_template(
                 return None
     except Exception:
         if not tools:
+            return None
+        if not allow_schema_free_tool_fallback:
             return None
         try:
             if template_observability is not None:
@@ -12236,6 +12243,7 @@ def _encode_messages_uncached(
             reasoning_effort=reasoning_effort,
             preserve_thinking=template_preserve_thinking,
             tools=template_tools,
+            allow_schema_free_tool_fallback=agent_middleware,
             template_observability=template_observability,
         )
         if rendered is not None:
@@ -26183,10 +26191,14 @@ def create_app(state: ServerState) -> FastAPI:
             else CacheMissReason.NEW_SESSION.value
         )
         session_restore_mode = "background_bypass" if background else "cold"
-        session_cache_scope = _session_cache_scope_for_request(
-            state,
-            headers=headers,
-            metadata=metadata,
+        session_cache_scope = (
+            _session_cache_scope_for_request(
+                state,
+                headers=headers,
+                metadata=metadata,
+            )
+            if agent_middleware_active
+            else "transparent_bypass"
         )
         policy_fingerprint = _policy_fingerprint(
             state,
@@ -26277,7 +26289,7 @@ def create_app(state: ServerState) -> FastAPI:
                 metadata=metadata,
                 tool_result_history_present=tool_result_history_present,
             )
-            if not background and not cache_bypass
+            if agent_middleware_active and not background and not cache_bypass
             else {
                 "eligible": False,
                 "cache_bypass": False,
@@ -26312,6 +26324,8 @@ def create_app(state: ServerState) -> FastAPI:
             cache_miss_reason = "vision_request_cache_bypass"
             session_restore_mode = "vision_bypass"
         if (
+            agent_middleware_active
+            and
             not background
             and not cache_bypass
             and (vision_splice is None or vision_cache_keying)
@@ -26372,15 +26386,23 @@ def create_app(state: ServerState) -> FastAPI:
             _record_tool_parse_event(state, event="tool_template_fallback")
         if request_observability.get("request_client_hint") == "android_studio":
             _record_tool_parse_event(state, event="android_studio_request_detected")
-        prefix_diagnostic = getattr(state.sessions, "last_prefix_diagnostic", None)
+        prefix_diagnostic = (
+            getattr(state.sessions, "last_prefix_diagnostic", None)
+            if agent_middleware_active
+            else None
+        )
         if isinstance(prefix_diagnostic, dict):
             request_observability["request_session_prefix_diagnostic"] = (
                 prefix_diagnostic
             )
-        session_keep_live_ref = _session_keep_live_refs_for_request(
-            session_source=session_source,
-            session_id=session_id,
-            tool_names=_tool_names(tool_specs) if tools_active else None,
+        session_keep_live_ref = (
+            _session_keep_live_refs_for_request(
+                session_source=session_source,
+                session_id=session_id,
+                tool_names=_tool_names(tool_specs) if tools_active else None,
+            )
+            if agent_middleware_active
+            else False
         )
         live_frontier_policy = "none"
         if agent_transcript_tools_active:
@@ -26388,7 +26410,8 @@ def create_app(state: ServerState) -> FastAPI:
                 "live_reference_lease" if session_keep_live_ref else "snapshot_only"
             )
         if (
-            _is_opencode_client(headers=headers, metadata=metadata)
+            agent_middleware_active
+            and _is_opencode_client(headers=headers, metadata=metadata)
             and agent_transcript_tools_active
         ):
             if _opencode_tool_history_live_frontier_enabled():
@@ -26429,7 +26452,8 @@ def create_app(state: ServerState) -> FastAPI:
             )
         session_bank_for_generation = (
             None
-            if background
+            if not agent_middleware_active
+            or background
             or cache_bypass
             or opencode_tool_history_cache_bypass
             or (vision_splice is not None and not vision_cache_keying)
@@ -26438,10 +26462,14 @@ def create_app(state: ServerState) -> FastAPI:
         request_observability["request_session_bank_bypass"] = (
             session_bank_for_generation is None
         )
-        commit_prompt_prefix = _commit_prompt_prefix_for_request(
-            state,
-            prompt_ids=prompt_ids,
-            tools_active=tools_active,
+        commit_prompt_prefix = (
+            _commit_prompt_prefix_for_request(
+                state,
+                prompt_ids=prompt_ids,
+                tools_active=tools_active,
+            )
+            if agent_middleware_active
+            else False
         )
         if read_only_force_answer_contract_active:
             # The forced-answer contract is a transient generation aid. OpenCode
@@ -26758,6 +26786,8 @@ def create_app(state: ServerState) -> FastAPI:
             None,
         )
         if (
+            agent_middleware_active
+            and
             _cross_session_sweep is not None
             and _postcommit_cross_session_yield_enabled()
         ):

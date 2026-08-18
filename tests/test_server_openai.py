@@ -3041,6 +3041,15 @@ def test_agent_middleware_off_bypasses_policy_rewrites_and_preserves_task(
     state.args.agent_middleware = "off"
     state.args.stats_footer = False
     state.runtime.tokenizer = CaptureTokenizer()
+    state.sessions.resolve_session_id = lambda **_kwargs: pytest.fail(
+        "transparent mode must not resolve a SessionBank session"
+    )
+    state.sessions.get_or_create = lambda _session_id: pytest.fail(
+        "transparent mode must not create a SessionBank session"
+    )
+    state.sessions.abort_cross_session_postcommits = lambda **_kwargs: pytest.fail(
+        "transparent mode must not manage SessionBank postcommits"
+    )
     client = TestClient(create_app(state))
 
     def forbidden_canonicalization(*_args, **_kwargs):
@@ -3090,9 +3099,12 @@ def test_agent_middleware_off_bypasses_policy_rewrites_and_preserves_task(
     tool_output = "uncompacted tool result\n" * 4_000
     response = client.post(
         "/v1/chat/completions",
-        headers={"x-mtplx-cache-mode": "bypass", "x-mtplx-client": "opencode"},
+        headers={"x-mtplx-client": "opencode"},
         json={
             "messages": [
+                {"role": "system", "content": ""},
+                {"role": "developer", "content": ""},
+                {"role": "user", "content": ""},
                 {"role": "system", "content": "OpenCode system message"},
                 {"role": "developer", "content": "OpenCode developer message"},
                 {"role": "user", "content": "Use the task tool"},
@@ -3132,9 +3144,13 @@ def test_agent_middleware_off_bypasses_policy_rewrites_and_preserves_task(
         "system",
         "system",
         "user",
+        "system",
+        "system",
+        "user",
         "assistant",
         "tool",
     ]
+    assert [message["content"] for message in rendered_messages[:3]] == ["", "", ""]
     assert rendered_messages[-1]["content"] == tool_output
     assert template_kwargs["tools"] == tools
     assert template_kwargs["tools"][-1]["function"]["name"] == "task"
@@ -3143,6 +3159,9 @@ def test_agent_middleware_off_bypasses_policy_rewrites_and_preserves_task(
     stats = captured["request_observability"]
     assert stats["agent_middleware"] == "off"
     assert stats["tool_prompt_mode"] == "native"
+    assert stats["session_cache_scope"] == "transparent_bypass"
+    assert stats["request_session_bank_bypass"] is True
+    assert captured["session_bank"] is None
     assert response.json()["mtplx_stats"]["agent_middleware"] == "off"
 
 
@@ -5233,6 +5252,7 @@ def test_transparent_agent_middleware_fails_instead_of_dropping_native_tools(
             "messages": [{"role": "user", "content": "Use task."}],
             "tools": [_tool_schema()],
             "tool_choice": "auto",
+            "enable_thinking": False,
             "max_tokens": 8,
         },
     )
