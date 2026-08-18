@@ -2231,6 +2231,18 @@ def test_serve_parser_accepts_bridge_prompt_flags():
     assert args.tool_prompt_mode == "native"
     assert args.chat_template_profile == "froggeric_v19"
 
+    qwen38_args = parser.parse_args(
+        [
+            "serve",
+            "--model",
+            "/tmp/model",
+            "--chat-template-profile",
+            "froggeric_v22_1",
+        ]
+    )
+
+    assert qwen38_args.chat_template_profile == "froggeric_v22_1"
+
     gemma_args = parser.parse_args(
         [
             "serve",
