@@ -684,6 +684,15 @@ def test_normalize_reasoning_effort_maps_openai_off_values() -> None:
     with pytest.raises(ValueError):
         srv._normalize_reasoning_effort("banana")
 
+def test_request_reasoning_effort_accepts_opencode_and_qwen_spellings() -> None:
+    from mtplx.server import openai as srv
+
+    assert srv._normalize_requested_reasoning_effort("minimal") == "low"
+    assert srv._normalize_requested_reasoning_effort("none") == "none"
+    assert srv._normalize_requested_reasoning_effort("high") == "high"
+    with pytest.raises(ValueError):
+        srv._normalize_requested_reasoning_effort("ultra")
+
 
 def test_reasoning_effort_vocabulary_covers_every_family() -> None:
     """No family may advertise a level the writing surfaces would reject.

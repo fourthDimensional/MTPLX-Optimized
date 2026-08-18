@@ -4640,6 +4640,219 @@ class ToolSchemaRejectingTokenizer(CaptureTokenizer):
         return [1, 2, 3]
 
 
+_QWEN38_REASONING_TEMPLATE_SOURCE = "<|think_low|> <|think_xhigh|>"
+
+
+def _qwen38_reasoning_state(*, agent_middleware: str) -> SimpleNamespace:
+    state = _fake_state()
+    state.args.agent_middleware = agent_middleware
+    state.args.model = "Qwen/Qwen3.8-27B"
+    state.args.reasoning = "on"
+    state.args.reasoning_effort = "medium"
+    state.args.temperature = 0.61
+    state.args.top_p = 0.87
+    state.args.top_k = 17
+    state.backend_descriptor = openai.descriptor_for_backend_id("qwen3_next")
+    state.chat_template_profile = "froggeric_v22_1"
+    state.runtime.tokenizer = CaptureTokenizer()
+    state.runtime.tokenizer.chat_template = _QWEN38_REASONING_TEMPLATE_SOURCE
+    return state
+
+
+def _reasoning_capture_generation(captured):
+    def fake_run_generation(_state, _prompt_ids, **kwargs):
+        captured.update(kwargs)
+        return {
+            "text": "ok",
+            "tokens": [4],
+            "stats": {
+                **kwargs["request_observability"],
+                "generation_mode": kwargs["generation_mode"],
+                "mtp_depth": kwargs["depth"],
+                "completion_tokens": 1,
+            },
+            "prompt_tokens": 3,
+            "completion_tokens": 1,
+            "finish_reason": "stop",
+        }
+
+    return fake_run_generation
+
+
+@pytest.mark.parametrize(
+    ("body_controls", "expected_effort", "expected_requested_effort", "source"),
+    [
+        ({"reasoning_effort": "low"}, "low", "low", "top_level"),
+        ({"reasoning_effort": "minimal"}, "low", "minimal", "top_level"),
+        (
+            {"chat_template_kwargs": {"reasoning_effort": "xhigh"}},
+            "xhigh",
+            "xhigh",
+            "chat_template_kwargs",
+        ),
+        (
+            {
+                "reasoning_effort": "high",
+                "chat_template_kwargs": {"reasoning_effort": "low"},
+            },
+            "xhigh",
+            "high",
+            "top_level",
+        ),
+    ],
+)
+def test_transparent_opencode_honors_request_reasoning_effort(
+    monkeypatch, body_controls, expected_effort, expected_requested_effort, source
+):
+    captured: dict[str, object] = {}
+    state = _qwen38_reasoning_state(agent_middleware="off")
+    client = TestClient(create_app(state))
+    monkeypatch.setattr(
+        openai, "_run_generation", _reasoning_capture_generation(captured)
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass", "x-mtplx-client": "opencode"},
+        json={
+            "messages": [{"role": "user", "content": "reason carefully"}],
+            "max_tokens": 4,
+            "temperature": 0.01,
+            "top_p": 0.1,
+            "top_k": 1,
+            **body_controls,
+        },
+    )
+
+    assert response.status_code == 200
+    _messages, template_kwargs = state.runtime.tokenizer.calls[-1]
+    assert template_kwargs["reasoning_effort"] == expected_effort
+    assert captured["temperature"] == state.args.temperature
+    assert captured["top_p"] == state.args.top_p
+    assert captured["top_k"] == state.args.top_k
+    stats = response.json()["mtplx_stats"]
+    assert stats["client_controls_allowed"] is False
+    assert stats["reasoning_controls_allowed"] is True
+    assert stats["reasoning_control_owner"] == "client"
+    assert stats["request_reasoning_effort_resolved"] == expected_effort
+    assert stats["request_reasoning_effort_requested"] == expected_requested_effort
+    assert stats["request_reasoning_effort_source"] == source
+    assert stats["reasoning_effort_template_supported"] is True
+    assert stats["client_control_fields_ignored"] == [
+        "temperature",
+        "top_p",
+        "top_k",
+    ]
+
+
+def test_transparent_opencode_reasoning_none_disables_thinking(monkeypatch):
+    captured: dict[str, object] = {}
+    state = _qwen38_reasoning_state(agent_middleware="off")
+    client = TestClient(create_app(state))
+    monkeypatch.setattr(
+        openai, "_run_generation", _reasoning_capture_generation(captured)
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass", "x-mtplx-client": "opencode"},
+        json={
+            "messages": [{"role": "user", "content": "answer directly"}],
+            "reasoning_effort": "none",
+            "max_tokens": 4,
+        },
+    )
+
+    assert response.status_code == 200
+    _messages, template_kwargs = state.runtime.tokenizer.calls[-1]
+    assert template_kwargs["enable_thinking"] is False
+    assert "reasoning_effort" not in template_kwargs
+    stats = response.json()["mtplx_stats"]
+    assert stats["request_enable_thinking"] is False
+    assert stats["request_reasoning_mode"] == "off"
+    assert stats["request_reasoning_effort_resolved"] is None
+    assert stats["request_reasoning_effort_requested"] == "none"
+    assert stats["request_reasoning_effort_source"] == "top_level"
+
+
+def test_transparent_reasoning_none_conflicts_with_explicit_thinking_on(monkeypatch):
+    state = _qwen38_reasoning_state(agent_middleware="off")
+    client = TestClient(create_app(state))
+    monkeypatch.setattr(
+        openai,
+        "_run_generation",
+        lambda *_args, **_kwargs: pytest.fail("conflicting request must not generate"),
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-client": "opencode"},
+        json={
+            "messages": [{"role": "user", "content": "hi"}],
+            "enable_thinking": True,
+            "reasoning_effort": "none",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "conflicts" in response.json()["error"]["message"]
+
+
+def test_transparent_qwen38_rejects_effort_without_an_effort_aware_template(
+    monkeypatch,
+):
+    state = _qwen38_reasoning_state(agent_middleware="off")
+    state.chat_template_profile = "custom"
+    state.runtime.tokenizer.chat_template = "plain qwen template"
+    client = TestClient(create_app(state))
+    monkeypatch.setattr(
+        openai,
+        "_run_generation",
+        lambda *_args, **_kwargs: pytest.fail("unsupported template must not generate"),
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-client": "opencode"},
+        json={
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "xhigh",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "froggeric_v22_1" in response.json()["error"]["message"]
+
+
+def test_legacy_opencode_middleware_keeps_reasoning_effort_server_owned(monkeypatch):
+    captured: dict[str, object] = {}
+    state = _qwen38_reasoning_state(agent_middleware="on")
+    state.args.reasoning_effort = "low"
+    client = TestClient(create_app(state))
+    monkeypatch.setattr(
+        openai, "_run_generation", _reasoning_capture_generation(captured)
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass", "x-mtplx-client": "opencode"},
+        json={
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "xhigh",
+            "max_tokens": 4,
+        },
+    )
+
+    assert response.status_code == 200
+    _messages, template_kwargs = state.runtime.tokenizer.calls[-1]
+    assert template_kwargs["reasoning_effort"] == "low"
+    stats = captured["request_observability"]
+    assert stats["client_controls_allowed"] is False
+    assert stats["request_reasoning_effort"] == "low"
+    assert "reasoning_controls_allowed" not in stats
+    assert stats["client_control_fields_ignored"] == ["reasoning_effort"]
+
+
 class QwenToolHistoryBoundaryTokenizer:
     """Tiny Qwen-like tokenizer that exposes the OpenCode cache-boundary bug.
 
@@ -9056,6 +9269,35 @@ def test_froggeric_v22_template_profile_applies_reasoning_effort_template():
     assert 'template_version = "qwen3.8-froggeric-v22.1"' in tokenizer.chat_template
     assert "<|think_xhigh|>" in tokenizer.chat_template
     assert "<|think_low|>" in tokenizer.chat_template
+
+
+@pytest.mark.parametrize(
+    ("effort", "expected", "forbidden"),
+    [
+        ("low", "Reasoning effort is set to low.", "xhigh"),
+        ("medium", "<|im_start|>assistant\n<think>\n", "Reasoning effort is set"),
+        ("xhigh", "Reasoning effort is set to xhigh.", "set to low"),
+        ("none", "<|im_start|>assistant\n<think>\n\n</think>\n\n", "Reasoning effort is set"),
+    ],
+)
+def test_froggeric_v22_template_renders_qwen38_reasoning_effort(
+    effort, expected, forbidden
+):
+    from jinja2 import Environment
+
+    path = openai._chat_template_profile_path("froggeric_v22_1")
+    assert path is not None
+    template = Environment().from_string(path.read_text(encoding="utf-8"))
+
+    rendered = template.render(
+        messages=[{"role": "user", "content": "ping"}],
+        add_generation_prompt=True,
+        enable_thinking=True,
+        reasoning_effort=effort,
+    )
+
+    assert expected in rendered
+    assert forbidden not in rendered
 
 
 def test_tool_contract_suppresses_agent_tail_for_simple_chitchat():

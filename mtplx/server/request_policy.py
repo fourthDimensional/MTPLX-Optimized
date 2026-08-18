@@ -123,6 +123,7 @@ class RequestPolicy:
     # Reasoning.
     thinking_enabled: bool = False
     reasoning_effort: str | None = None
+    reasoning_controls_allowed: bool = False
     aime_visible_working: bool = False
 
     # Control ownership.
@@ -316,6 +317,7 @@ def _control_ownership_observability(
     request: Any,
     *,
     client_controls_allowed: bool,
+    reasoning_controls_allowed: bool = False,
     observability: dict[str, Any],
     thinking_controls_allowed: bool | None = None,
 ) -> None:
@@ -331,13 +333,10 @@ def _control_ownership_observability(
     observability["client_controls_allowed"] = bool(client_controls_allowed)
     observability["thinking_controls_allowed"] = bool(thinking_allowed)
     if not client_controls_allowed:
-        ignored_fields = srv._ignored_client_control_fields(request)
-        if thinking_allowed:
-            ignored_fields = [
-                field
-                for field in ignored_fields
-                if field not in ("enable_thinking", "reasoning_effort")
-            ]
+        ignored_fields = srv._ignored_client_control_fields(
+            request,
+            reasoning_controls_allowed=reasoning_controls_allowed,
+        )
         if ignored_fields:
             observability["client_control_fields_ignored"] = ignored_fields
 
@@ -560,6 +559,9 @@ def resolve_request_policy(
     thinking_controls_allowed = srv._client_thinking_controls_allowed(
         headers, metadata, state=state
     )
+    reasoning_controls_allowed = bool(
+        thinking_controls_allowed or not agent_middleware_active
+    )
     pi_convergence_contract_active = bool(
         agent_middleware_active
         and chat
@@ -691,17 +693,50 @@ def resolve_request_policy(
         or srv._foreground_model_work_pending(state)
     ):
         raise BackgroundBusyBypass()
+    request_effort_value, request_effort_source = srv._requested_reasoning_effort(
+        request
+    )
+    requested_effort: str | None = None
+    if reasoning_controls_allowed and request_effort_value is not None:
+        try:
+            requested_effort = srv._normalize_requested_reasoning_effort(
+                request_effort_value
+            )
+        except ValueError as exc:
+            raise srv.HTTPException(status_code=400, detail=str(exc)) from exc
+    requested_enable_thinking = srv._requested_enable_thinking(request)
+    if (
+        reasoning_controls_allowed
+        and requested_effort == "none"
+        and requested_enable_thinking is True
+    ):
+        raise srv.HTTPException(
+            status_code=400,
+            detail="enable_thinking=true conflicts with reasoning_effort='none'",
+        )
     thinking_enabled = srv._thinking_enabled_for_request(
         state,
         request,
-        allow_client_controls=thinking_controls_allowed,
+        allow_client_controls=reasoning_controls_allowed,
     )
+    if reasoning_controls_allowed and requested_effort == "none":
+        thinking_enabled = False
     reasoning_effort = srv._reasoning_effort_for_state(
         state,
         thinking_enabled=thinking_enabled,
-        request_effort=request.reasoning_effort,
-        allow_client_controls=thinking_controls_allowed,
+        request_effort=requested_effort,
+        allow_client_controls=reasoning_controls_allowed,
     )
+    reasoning_effort_template_supported: bool | None = None
+    if not agent_middleware_active and requested_effort is not None:
+        reasoning_effort_template_supported = (
+            srv._template_supports_qwen38_reasoning_effort(state)
+        )
+        srv._require_qwen38_reasoning_effort_template(
+            state,
+            requested_effort=requested_effort,
+            resolved_effort=reasoning_effort,
+        )
     if (
         read_only_force_answer_contract_active
         and srv._reasoning_parser_for_state(state) == "gemma4"
@@ -774,6 +809,7 @@ def resolve_request_policy(
             tool_result_history_present=tool_result_history_present,
             thinking_enabled=thinking_enabled,
             reasoning_effort=reasoning_effort,
+            reasoning_controls_allowed=reasoning_controls_allowed,
             client_controls_allowed=client_controls_allowed,
             tool_prompt_mode=tool_prompt_mode,
             template_tool_prompt_mode=template_tool_prompt_mode,
@@ -813,13 +849,13 @@ def resolve_request_policy(
         server_reasoning_mode = (
             "on" if bool(getattr(state.args, "enable_thinking", True)) else "off"
         )
-    if not thinking_controls_allowed:
+    if not reasoning_controls_allowed:
         request_reasoning_mode = (
             "off" if not thinking_enabled else server_reasoning_mode
         )
-    elif request.enable_thinking is False:
+    elif not thinking_enabled:
         request_reasoning_mode = "off"
-    elif request.enable_thinking is True:
+    elif requested_enable_thinking is True and server_reasoning_mode == "auto":
         request_reasoning_mode = "on"
     else:
         request_reasoning_mode = server_reasoning_mode
@@ -830,17 +866,35 @@ def resolve_request_policy(
         _responses_reasoning_observability(metadata, reasoning_effort)
     )
     observability["request_enable_thinking_override"] = (
-        request.enable_thinking is not None and thinking_controls_allowed
+        requested_enable_thinking is not None and reasoning_controls_allowed
     )
     _control_ownership_observability(
         request,
         client_controls_allowed=client_controls_allowed,
         thinking_controls_allowed=thinking_controls_allowed,
+        reasoning_controls_allowed=reasoning_controls_allowed,
         observability=observability,
     )
     observability["request_reasoning_parser"] = srv._reasoning_parser_for_state(state)
     if not agent_middleware_active:
         observability["agent_middleware"] = "off"
+        observability["reasoning_controls_allowed"] = bool(
+            reasoning_controls_allowed
+        )
+        observability["reasoning_control_owner"] = (
+            "client" if reasoning_controls_allowed else "server"
+        )
+        observability["request_reasoning_effort_requested"] = (
+            str(request_effort_value).strip().lower()
+            if request_effort_value is not None
+            else None
+        )
+        observability["request_reasoning_effort_resolved"] = reasoning_effort
+        observability["request_reasoning_effort_source"] = request_effort_source
+        if reasoning_effort_template_supported is not None:
+            observability["reasoning_effort_template_supported"] = bool(
+                reasoning_effort_template_supported
+            )
     observability["request_read_only_inspection_force_answer"] = bool(
         read_only_force_answer_contract_active
     )
@@ -967,6 +1021,7 @@ def resolve_request_policy(
         background=background,
         thinking_enabled=thinking_enabled,
         reasoning_effort=reasoning_effort,
+        reasoning_controls_allowed=reasoning_controls_allowed,
         aime_visible_working=aime_visible_working,
         client_controls_allowed=client_controls_allowed,
         tool_prompt_mode=tool_prompt_mode,
