@@ -619,6 +619,16 @@ def _add_fan_mode_args(parser: argparse.ArgumentParser, *, max_help: str) -> Non
 
 def _add_bridge_prompt_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
+        "--agent-middleware",
+        choices=["on", "off"],
+        default="on",
+        help=(
+            "Agent request middleware. on preserves MTPLX compatibility "
+            "rewrites; off transparently passes incoming messages and tools "
+            "to the model chat template."
+        ),
+    )
+    parser.add_argument(
         "--tool-prompt-mode",
         choices=["hybrid", "native"],
         default="hybrid",

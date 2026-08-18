@@ -370,6 +370,18 @@ def test_server_cli_surfaces_default_to_sustained_profile():
     assert serve_args.profile == "sustained"
 
 
+def test_serve_parser_exposes_agent_middleware_switch(monkeypatch, tmp_path):
+    monkeypatch.setenv("MTPLX_CONFIG", str(tmp_path / "missing-config.toml"))
+    parser = build_parser()
+
+    assert parser.parse_args(["serve", "--yes"]).agent_middleware == "on"
+    assert (
+        parser.parse_args(["serve", "--yes", "--agent-middleware", "off"])
+        .agent_middleware
+        == "off"
+    )
+
+
 def test_serve_parser_accepts_legacy_app_profile_strings():
     # Shipped app builds persisted profile "auto" / "sustained-max"; the
     # parser must canonicalize them instead of exiting 2 at startup.
@@ -1843,6 +1855,7 @@ def test_laguna_opencode_payload_uses_native_tools_and_32k_context(monkeypatch):
         max_response_tokens=None,
         reasoning=None,
         reasoning_parser="qwen3",
+        agent_middleware="off",
         tool_prompt_mode="hybrid",
         chat_template_profile="local_qwen36",
         _cli_flags=set(),
@@ -1865,6 +1878,8 @@ def test_laguna_opencode_payload_uses_native_tools_and_32k_context(monkeypatch):
     assert payload["context_window"] == 32_768
     assert payload["output_limit"] == 32_768
     assert payload["tool_prompt_mode"] == "native"
+    assert payload["agent_middleware"] == "off"
+    assert "--agent-middleware off" in payload["server_command"]
     assert "--tool-prompt-mode native" in payload["server_command"]
     assert "--context-window 32768" in payload["server_command"]
 
