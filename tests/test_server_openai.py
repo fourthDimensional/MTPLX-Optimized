@@ -30,6 +30,21 @@ def test_server_parser_accepts_native_app_launch_id():
     assert args.app_launch_id == "native-123"
 
 
+def test_server_parser_accepts_ordered_retrieval_model_roots():
+    args = parse_args(
+        [
+            "--warmup-tokens",
+            "0",
+            "--retrieval-model-root",
+            "/models/archive",
+            "--retrieval-model-root",
+            "/models/external",
+        ]
+    )
+
+    assert args.retrieval_model_roots == ["/models/archive", "/models/external"]
+
+
 def test_direct_server_parser_exposes_mtp_batch_numerics():
     args = parse_args(["--mtp-batch-numerics", "b1-exact", "--warmup-tokens", "0"])
 
@@ -857,6 +872,213 @@ def test_mtp_batch_installs_qwen35b_optimized_kernel_routes_at_construction():
     }
 
 
+_QWEN4_EXP_FAMILY_ENV_DEFAULTS = (
+    "MTPLX_COMPILED_GDN",
+    "MTPLX_FAMILY_CAPTURE_COMMIT",
+    "MTPLX_FUSED_HC_V3",
+    "MTPLX_FUSED_GDN_INPROJ",
+    "MTPLX_FUSED_GATE_UP",
+    "MTPLX_FUSED_GDN_CONVNORM",
+    "MTPLX_FUSED_GDN_STEP",
+    "MTPLX_FUSED_CONVNORM_VERIFY",
+    # Rows-gather family default (2026-08-28, adapting PR #380 by @maceip):
+    # self-fenced to S 2..8 at KV >= 16384; kill switch MTPLX_QSA_GATHER=0.
+    "MTPLX_QSA_GATHER",
+)
+
+
+def test_qwen4_exp_family_defaults_octet_and_nax_neutralize(tmp_path, monkeypatch):
+    """qwen4_exp packs get the measured fast-lane octet plus NAX held OFF.
+
+    The octet ships the family's measured wins (newest: the one-dispatch
+    GDN step, two boot-triples in both arm orders 2026-08-27). NAX verify
+    is family-neutralized because turbo's 27B patch is unmeasured here; an
+    explicit operator export must win over both defaults.
+    """
+
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "qwen4_exp"}), encoding="utf-8"
+    )
+    args = SimpleNamespace(
+        generation_mode="mtp",
+        verify_strategy="capture_commit",
+        model=str(tmp_path),
+    )
+    for key in (
+        *_QWEN4_EXP_FAMILY_ENV_DEFAULTS,
+        "MTPLX_BATCH_TARGET_ARRAYS",
+        "MTPLX_LAZY_TARGET_DISTRIBUTIONS",
+        "MTPLX_QWEN4_BATCHED_TARGET_DISTRIBUTIONS",
+        "MTPLX_NAX_VERIFY",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    overrides = openai._server_runtime_env_overrides(args, {})
+    for key in _QWEN4_EXP_FAMILY_ENV_DEFAULTS:
+        assert overrides.get(key) == "1", key
+    # The PR #391 lane (davidtai) is geometry-gated: a bare qwen4_exp config
+    # keeps turbo's lazy target-distribution defaults untouched, the one
+    # measured fixed-M4 geometry pins the batched pair by default (below).
+    assert "MTPLX_BATCH_TARGET_ARRAYS" not in overrides
+    assert "MTPLX_LAZY_TARGET_DISTRIBUTIONS" not in overrides
+    assert overrides.get("MTPLX_NAX_VERIFY") == "0"
+
+    # Every emitted key must survive the boot-time validator — the 08-27
+    # turbo QA boot died on an unregistered MTPLX_FUSED_GDN_STEP while this
+    # test was green, because normalize only runs inside apply_profile_env.
+    from mtplx.profiles import normalize_runtime_env_overrides
+
+    assert normalize_runtime_env_overrides(overrides) == overrides
+
+    # The opt-in gate pins the batched pair, from an operator export ...
+    monkeypatch.setenv("MTPLX_QWEN4_BATCHED_TARGET_DISTRIBUTIONS", "1")
+    batched = openai._server_runtime_env_overrides(args, {})
+    assert batched.get("MTPLX_BATCH_TARGET_ARRAYS") == "1"
+    assert batched.get("MTPLX_LAZY_TARGET_DISTRIBUTIONS") == "0"
+    assert normalize_runtime_env_overrides(batched) == batched
+    # ... or from the pack contract's runtime_env_overrides.
+    monkeypatch.delenv("MTPLX_QWEN4_BATCHED_TARGET_DISTRIBUTIONS", raising=False)
+    from_pack = openai._server_runtime_env_overrides(
+        args, {"MTPLX_QWEN4_BATCHED_TARGET_DISTRIBUTIONS": "1"}
+    )
+    assert from_pack.get("MTPLX_BATCH_TARGET_ARRAYS") == "1"
+    assert from_pack.get("MTPLX_LAZY_TARGET_DISTRIBUTIONS") == "0"
+    assert normalize_runtime_env_overrides(from_pack) == from_pack
+
+    # Operator env beats every family default (the launch-time export lane).
+    monkeypatch.setenv("MTPLX_QWEN4_BATCHED_TARGET_DISTRIBUTIONS", "1")
+    monkeypatch.setenv("MTPLX_FUSED_GDN_STEP", "0")
+    monkeypatch.setenv("MTPLX_BATCH_TARGET_ARRAYS", "0")
+    monkeypatch.setenv("MTPLX_LAZY_TARGET_DISTRIBUTIONS", "1")
+    monkeypatch.setenv("MTPLX_NAX_VERIFY", "1")
+    monkeypatch.setenv("MTPLX_QSA_GATHER", "0")
+    pinned = openai._server_runtime_env_overrides(args, {})
+    assert "MTPLX_FUSED_GDN_STEP" not in pinned
+    assert "MTPLX_BATCH_TARGET_ARRAYS" not in pinned
+    assert "MTPLX_LAZY_TARGET_DISTRIBUTIONS" not in pinned
+    assert "MTPLX_NAX_VERIFY" not in pinned
+    assert "MTPLX_QSA_GATHER" not in pinned
+
+    # Non-family models get neither the octet nor the neutralize, and the
+    # opt-in gate (still exported here) pins nothing outside the family.
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    (plain / "config.json").write_text(
+        json.dumps({"model_type": "qwen3_next"}), encoding="utf-8"
+    )
+    monkeypatch.delenv("MTPLX_FUSED_GDN_STEP", raising=False)
+    monkeypatch.delenv("MTPLX_BATCH_TARGET_ARRAYS", raising=False)
+    monkeypatch.delenv("MTPLX_LAZY_TARGET_DISTRIBUTIONS", raising=False)
+    monkeypatch.delenv("MTPLX_NAX_VERIFY", raising=False)
+    other = openai._server_runtime_env_overrides(
+        SimpleNamespace(
+            generation_mode="mtp",
+            verify_strategy="capture_commit",
+            model=str(plain),
+        ),
+        {},
+    )
+    for key in (
+        *_QWEN4_EXP_FAMILY_ENV_DEFAULTS,
+        "MTPLX_BATCH_TARGET_ARRAYS",
+        "MTPLX_LAZY_TARGET_DISTRIBUTIONS",
+        "MTPLX_NAX_VERIFY",
+    ):
+        assert key not in other, key
+
+    # The measured fixed-M4 geometry (Flash-Next) pins the batched pair by
+    # default (2026-09-02 lane flip); an explicit =0 export still wins.
+    monkeypatch.delenv("MTPLX_QWEN4_BATCHED_TARGET_DISTRIBUTIONS", raising=False)
+    flash_next = tmp_path / "flash-next"
+    flash_next.mkdir()
+    (flash_next / "config.json").write_text(
+        json.dumps(_flash_next_fixed_m4_config()), encoding="utf-8"
+    )
+    geometry_args = SimpleNamespace(
+        generation_mode="mtp",
+        verify_strategy="batched",
+        model=str(flash_next),
+    )
+    lane = openai._server_runtime_env_overrides(geometry_args, {})
+    assert lane.get("MTPLX_QWEN4_BATCHED_TARGET_DISTRIBUTIONS") == "1"
+    assert lane.get("MTPLX_BATCH_TARGET_ARRAYS") == "1"
+    assert lane.get("MTPLX_LAZY_TARGET_DISTRIBUTIONS") == "0"
+    assert lane.get("MTPLX_NAX_VERIFY") == "0"
+    assert normalize_runtime_env_overrides(lane) == lane
+    monkeypatch.setenv("MTPLX_QWEN4_BATCHED_TARGET_DISTRIBUTIONS", "0")
+    dark = openai._server_runtime_env_overrides(geometry_args, {})
+    assert "MTPLX_QWEN4_BATCHED_TARGET_DISTRIBUTIONS" not in dark
+    assert "MTPLX_BATCH_TARGET_ARRAYS" not in dark
+    assert "MTPLX_LAZY_TARGET_DISTRIBUTIONS" not in dark
+
+
+@pytest.mark.parametrize("client", ["chat", "opencode", "pi", "hermes"])
+@pytest.mark.parametrize("flash_next", [True, False])
+def test_client_launch_defaults_preserve_model_distribution_policy(
+    tmp_path, monkeypatch, client, flash_next
+):
+    """A client preset is not an operator override of the model's fast path."""
+    from mtplx.commands.public import (
+        _apply_hermes_memory_env_defaults,
+        _apply_opencode_memory_env_defaults,
+        _apply_pi_history_budget_env_defaults,
+    )
+    from mtplx.profiles import apply_profile_env
+
+    for key in tuple(os.environ):
+        if key.startswith("MTPLX_"):
+            monkeypatch.delenv(key)
+    config = _flash_next_fixed_m4_config() if flash_next else {"model_type": "qwen3_next"}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    launch_env = {}
+    if client != "chat":
+        {
+            "opencode": _apply_opencode_memory_env_defaults,
+            "pi": _apply_pi_history_budget_env_defaults,
+            "hermes": _apply_hermes_memory_env_defaults,
+        }[client](launch_env)
+    for key, value in launch_env.items():
+        monkeypatch.setenv(key, value)
+    args = SimpleNamespace(generation_mode="mtp", verify_strategy="batched", model=str(tmp_path))
+    overrides = openai._server_runtime_env_overrides(args, {})
+    apply_profile_env("turbo", environ=launch_env, runtime_env_overrides=overrides)
+    assert launch_env["MTPLX_LAZY_TARGET_DISTRIBUTIONS"] == ("0" if flash_next else "1")
+    assert launch_env["MTPLX_BATCH_TARGET_ARRAYS"] == ("1" if flash_next else "0")
+    # Removing the lazy-distribution pin alone activates this dormant
+    # launcher pin, shortens D3 to three verify rows and bypasses fixed M4.
+    assert "MTPLX_LAZY_BONUS_VERIFY" not in launch_env
+
+
+def _flash_next_fixed_m4_config() -> dict:
+    """The one measured Flash-Next geometry (qwen4_fixed_verify predicate)."""
+
+    return {
+        "model_type": "qwen4_exp",
+        "text_config": {
+            "model_type": "qwen4_exp_text",
+            "hidden_size": 2560,
+            "num_hidden_layers": 48,
+            "hc_count": 4,
+            "hc_lowrank": 320,
+            "indexer_compress_ratio": 4,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 48,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128,
+            "ple_layer_ids": [2],
+            "ngram_size": 3,
+            "ngram_vocab_size_base": 20_000_000,
+            "heads_per_ngram": 8,
+            "ple_embed_dim": 2560,
+            "ngram_sidecar": True,
+            "num_experts": 512,
+            "num_experts_per_tok": 10,
+            "moe_intermediate_size": 640,
+            "vocab_size": 248_320,
+        },
+    }
+
+
 def test_server_parser_accepts_tool_prompt_and_template_profile():
     args = parse_args(
         [
@@ -1223,6 +1445,18 @@ def test_metrics_envelope_excludes_ssd_restore_from_decode_timing():
     assert envelope["decode_elapsed_s"] == 5.0
     assert envelope["decode_tok_s"] == 12.8
     assert envelope["display_decode_tok_s"] == 12.8
+
+
+def test_decode_timing_preserves_native_prompt_setup_accounting():
+    rate, seconds = openai._decode_timing({
+        "generated_tokens": 5252,
+        "elapsed_s": 140.07,
+        "prompt_eval_time_s": 13.35,
+        "prompt_state_total_time_s": 24.44,
+        "decode_elapsed_s": 115.63,
+    })
+    assert seconds == pytest.approx(115.63)
+    assert rate == pytest.approx(5252 / 115.63)
 
 
 def test_ar_batch_keeps_tool_history_turns_in_fair_lane():
@@ -1751,6 +1985,8 @@ def _fake_state(*, api_key: str | None = None, rate_limit: int = 0):
     argv = ["--warmup-tokens", "0", "--rate-limit", str(rate_limit)]
     if api_key:
         argv.extend(["--api-key", api_key])
+    # The default --model is the Qwen 3.8 27B, so the launch sampler is that
+    # family's own 1.0 / 0.95 / 20, the same values /health reports.
     args = parse_args(argv)
     return SimpleNamespace(
         args=args,
@@ -1805,6 +2041,15 @@ def _fake_streaming_session_state():
     state.postcommit_executor = FakeExecutor()
     state.args.stats_footer = False
     return state
+
+
+def test_server_parser_exposes_agent_middleware_switch():
+    assert parse_args(["--warmup-tokens", "0"]).agent_middleware == "on"
+    assert (
+        parse_args(["--warmup-tokens", "0", "--agent-middleware", "off"])
+        .agent_middleware
+        == "off"
+    )
 
 
 def _fake_final_state(tokens):
@@ -2121,6 +2366,30 @@ def test_step_descriptor_is_experimental_and_not_qwen_tune():
     )
 
 
+def test_single_step_mtp_backends_offer_depth_one_only():
+    """Nemotron-H and MiMo mtp_forward reject mtp_depth > 1, so the depth
+    control must not offer D2/D3 and the default must not resolve to a
+    depth the backend refuses (issue #341)."""
+
+    for backend_id in ("nemotron_h_mtp", "mimo_mtp"):
+        descriptor = openai.descriptor_for_backend_id(backend_id)
+        controls = openai.model_controls_for_descriptor(descriptor)
+
+        assert controls["draft_control"]["default"] == 1
+        assert controls["draft_control"]["minimum"] == 1
+        assert controls["draft_control"]["maximum"] == 1
+        assert controls["draft_control"]["value_labels"] == ["D1"]
+        # Serve startup rewrites args.backend_id to the resolved
+        # descriptor's id; the cap must survive that round-trip.
+        round_trip = openai.descriptor_for_backend_id(descriptor.backend_id)
+        assert round_trip.draft_semantics.maximum == 1
+        assert round_trip.draft_semantics.default == 1
+
+    # The generic native-contract lane keeps its multi-step range.
+    generic = openai.descriptor_for_backend_id("native_mtp")
+    assert generic.draft_semantics.maximum == 3
+
+
 def test_step_backend_chat_policy_injects_language_anchor():
     state = _fake_state()
     state.backend_descriptor = openai.descriptor_for_backend_id("step3p5_mtp")
@@ -2313,7 +2582,7 @@ def test_openai_server_health_metrics_and_models_fake_state():
     assert health.json()["profile"]["model_id"] == "mtplx-test-model"
     assert health.json()["profile"]["profile_default_model_id"] != "mtplx-test-model"
     assert health.json()["profile"]["sampler"] == {
-        "temperature": 0.6,
+        "temperature": 1.0,
         "top_p": 0.95,
         "top_k": 20,
     }
@@ -2375,6 +2644,138 @@ def test_openai_server_health_profile_sampler_reports_active_override():
         "top_p": 0.95,
         "top_k": 20,
     }
+
+
+_FAMILY_SAMPLER = {"temperature": 1.0, "top_p": 0.95, "top_k": 20}
+_CODING_SAMPLER = {"temperature": 0.6, "top_p": 0.95, "top_k": 20}
+# case -> (folder, config model_type, mtplx_runtime.json, sampler served).
+# Test names stay free of family markers: pytest puts the test name in
+# tmp_path, and a marker there would decide the family instead of the pack.
+_DIRECT_BOOT_PACKS = {
+    # Bonsai 2, a Qwen 3.8-27B derivative on the prism model type, in a
+    # folder with no family marker: the pack's own runtime family decides.
+    "bonsai-2": (
+        "pack",
+        "prism_hadamard_qwen35",
+        {"model_family": "qwen3_8", "sampler": _FAMILY_SAMPLER},
+        _FAMILY_SAMPLER,
+    ),
+    "qwen-3.8-27b": (
+        "Qwen3.8-27B-MTPLX-Optimized-Speed",
+        "qwen3_5",
+        {"sampler": _FAMILY_SAMPLER},
+        _FAMILY_SAMPLER,
+    ),
+    "qwen-3.6-27b": (
+        "Qwen3.6-27B-MTPLX-Optimized-Speed",
+        "qwen3_5",
+        {"sampler": _CODING_SAMPLER},
+        _CODING_SAMPLER,
+    ),
+    # A 3.5 pack stamped 1.0 keeps the coding sampler: only a family that
+    # owns its sampler resolves one, a pack stamp alone never does.
+    "qwen-3.5-stamped-1.0": (
+        "Qwen3.5-4B-MTPLX-Optimized-Speed",
+        "qwen3_5",
+        {"sampler": _FAMILY_SAMPLER},
+        _CODING_SAMPLER,
+    ),
+}
+
+
+def _direct_boot_pack(tmp_path: Path, case: str) -> tuple[Path, dict]:
+    folder, model_type, runtime, expected = _DIRECT_BOOT_PACKS[case]
+    pack = tmp_path / folder
+    pack.mkdir()
+    (pack / "config.json").write_text(
+        json.dumps(
+            {"model_type": model_type, "text_config": {"model_type": "qwen3_5_text"}}
+        ),
+        encoding="utf-8",
+    )
+    (pack / "mtplx_runtime.json").write_text(json.dumps(runtime), encoding="utf-8")
+    return pack, expected
+
+
+def _launch_sampler(args) -> dict:
+    return {"temperature": args.temperature, "top_p": args.top_p, "top_k": args.top_k}
+
+
+@pytest.mark.parametrize("case", sorted(_DIRECT_BOOT_PACKS))
+def test_direct_daemon_boot_serves_the_family_sampler(tmp_path, case):
+    """A daemon started as `python -m mtplx.server.openai` with no sampler
+    flags serves what `mtplx serve` would inject. Bonsai 2 started this way
+    sampled every request at 0.6 while /health said 1.0 (2026-09-22)."""
+
+    pack, expected = _direct_boot_pack(tmp_path, case)
+
+    args = parse_args(["--model", str(pack), "--warmup-tokens", "0"])
+
+    assert _launch_sampler(args) == expected
+
+
+def test_direct_daemon_boot_keeps_explicit_sampler_flags(tmp_path):
+    pack, _expected = _direct_boot_pack(tmp_path, "bonsai-2")
+
+    typed = parse_args(
+        ["--model", str(pack), "--warmup-tokens", "0", "--temperature", "0.7"]
+    )
+    assert _launch_sampler(typed) == {"temperature": 0.7, "top_p": 0.95, "top_k": 20}
+
+    # `mtplx serve` forwards a config.toml pin as a flag. A pin equal to the
+    # generic default still wins: presence decides, not the value.
+    pinned = parse_args(
+        [
+            "--model",
+            str(pack),
+            "--warmup-tokens",
+            "0",
+            "--temperature",
+            "0.6",
+            "--top-p",
+            "0.9",
+            "--top-k",
+            "40",
+        ]
+    )
+    assert _launch_sampler(pinned) == {"temperature": 0.6, "top_p": 0.9, "top_k": 40}
+
+
+@pytest.mark.parametrize("case", ["bonsai-2", "qwen-3.6-27b"])
+def test_direct_daemon_health_matches_the_request_sampler(tmp_path, monkeypatch, case):
+    pack, expected = _direct_boot_pack(tmp_path, case)
+    state = _fake_state()
+    state.args = parse_args(
+        ["--model", str(pack), "--warmup-tokens", "0", "--rate-limit", "0"]
+    )
+    state.runtime.tokenizer = CaptureTokenizer()
+    captured: dict[str, object] = {}
+
+    def fake_run_generation(_state, _prompt_ids, **kwargs):
+        captured.update(kwargs)
+        return _fake_generation("READY")
+
+    monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+    client = TestClient(create_app(state))
+
+    health = client.get("/health").json()
+    sampling = health["startup"]["model_controls"]["sampling"]
+    assert {key: sampling[key] for key in expected} == expected
+    assert health["profile"]["sampler"] == expected
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={"messages": [{"role": "user", "content": "Say READY"}], "max_tokens": 4},
+    )
+
+    assert response.status_code == 200
+    stats = captured["request_observability"]
+    assert {
+        "temperature": stats["effective_temperature"],
+        "top_p": stats["effective_top_p"],
+        "top_k": stats["effective_top_k"],
+    } == expected
 
 
 def test_chat_completion_response_reports_served_model_when_request_model_is_stale(
@@ -2910,7 +3311,7 @@ def test_chat_request_controls_are_server_owned_without_override(monkeypatch):
     assert response.status_code == 200
     assert captured["generation_mode"] == "mtp"
     assert captured["depth"] == 3
-    assert captured["temperature"] == 0.6
+    assert captured["temperature"] == 1.0
     assert captured["top_p"] == 0.95
     assert captured["top_k"] == 20
     _messages, template_kwargs = state.runtime.tokenizer.calls[0]
@@ -2949,7 +3350,7 @@ def test_chat_request_controls_are_server_owned_without_override(monkeypatch):
     ]
 
 
-def test_opencode_chitchat_history_reaches_model_with_tools_kept(monkeypatch):
+def test_opencode_chitchat_history_reaches_model_with_tools_kept(legacy_rewrites, monkeypatch):
     captured: dict[str, object] = {}
     state = _fake_state()
     state.runtime.tokenizer = CaptureTokenizer()
@@ -3022,6 +3423,159 @@ def test_opencode_chitchat_history_reaches_model_with_tools_kept(monkeypatch):
     assert "MTPLX tool contract:" in rendered_text
     assert "session_status()" in rendered_text
     assert "How are you?" in rendered_text
+
+
+def test_agent_middleware_off_bypasses_policy_rewrites_and_preserves_task(
+    monkeypatch,
+):
+    captured: dict[str, object] = {}
+    state = _fake_state()
+    state.args.agent_middleware = "off"
+    state.args.stats_footer = False
+    state.runtime.tokenizer = CaptureTokenizer()
+    state.sessions.bank = RecordingBank()
+    # A legacy Open WebUI background-task detector sees a short request with
+    # a new system prompt as maintenance work. Transparent mode must not
+    # apply that agent-scheduling heuristic to the client's raw history.
+    state.main_system_prompt_hash = "a-different-client-system-prompt"
+    # CaptureTokenizer uses a tiny fixed token sequence; lower only the
+    # admission threshold so this endpoint test can exercise the otherwise
+    # long-context exact-prefix cache path.
+    monkeypatch.setattr(openai, "_TRANSPARENT_EXACT_PREFIX_CACHE_MIN_TOKENS", 1)
+    state.sessions.resolve_session_id = lambda **_kwargs: pytest.fail(
+        "transparent mode must not resolve a SessionBank session"
+    )
+    state.sessions.get_or_create = lambda _session_id: pytest.fail(
+        "transparent mode must not create a SessionBank session"
+    )
+    state.sessions.abort_cross_session_postcommits = lambda **_kwargs: pytest.fail(
+        "transparent mode must not manage SessionBank postcommits"
+    )
+    client = TestClient(create_app(state))
+
+    def forbidden_canonicalization(*_args, **_kwargs):
+        pytest.fail("transparent mode must not canonicalize the transcript")
+
+    def forbidden_backend_policy(*_args, **_kwargs):
+        pytest.fail("transparent mode must not inject a backend chat policy")
+
+    def fake_run_generation(_state, _prompt_ids, **kwargs):
+        captured.update(kwargs)
+        return {
+            "text": "ok",
+            "tokens": [4],
+            "stats": {
+                **kwargs["request_observability"],
+                "generation_mode": "ar",
+                "mtp_depth": 0,
+                "completion_tokens": 1,
+            },
+            "prompt_tokens": 3,
+            "completion_tokens": 1,
+            "finish_reason": "stop",
+        }
+
+    monkeypatch.setattr(openai, "_canonicalize_agent_transcript", forbidden_canonicalization)
+    monkeypatch.setattr(openai, "_with_backend_chat_policy", forbidden_backend_policy)
+    monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+
+    def long_tool(name: str) -> dict[str, object]:
+        return {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": "long schema " * 120,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "payload": {"type": "string", "description": "x" * 400}
+                    },
+                    "required": ["payload"],
+                },
+            },
+        }
+
+    tools = [long_tool(f"tool_{index}") for index in range(42)]
+    tools.append(long_tool("task"))
+    tool_output = "uncompacted tool result\n" * 4_000
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-client": "opencode"},
+        json={
+            "messages": [
+                {"role": "system", "content": ""},
+                {"role": "developer", "content": ""},
+                {"role": "user", "content": ""},
+                {"role": "system", "content": "OpenCode system message"},
+                {"role": "developer", "content": "OpenCode developer message"},
+                {"role": "user", "content": "Use the task tool"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_task",
+                            "type": "function",
+                            "function": {
+                                "name": "task",
+                                "arguments": '{"subagent_type":"explore"}',
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_task",
+                    "content": tool_output,
+                },
+            ],
+            "tools": tools,
+            "tool_choice": "auto",
+            "max_tokens": 8,
+        },
+    )
+
+    assert response.status_code == 200
+    assert client.get("/health").json()["startup"]["agent_middleware"] == "off"
+    rendered_messages, template_kwargs = state.runtime.tokenizer.calls[-1]
+    rendered_content = "\n".join(
+        str(message.get("content") or "") for message in rendered_messages
+    )
+    assert [message["role"] for message in rendered_messages] == [
+        "system",
+        "system",
+        "user",
+        "system",
+        "system",
+        "user",
+        "assistant",
+        "tool",
+    ]
+    assert [message["content"] for message in rendered_messages[:3]] == ["", "", ""]
+    assert rendered_messages[-1]["content"] == tool_output
+    assert template_kwargs["tools"] == tools
+    assert template_kwargs["tools"][-1]["function"]["name"] == "task"
+    assert "MTPLX " not in rendered_content
+    assert "<mtplx_compacted_" not in rendered_content
+    stats = captured["request_observability"]
+    assert stats["agent_middleware"] == "off"
+    assert stats["tool_prompt_mode"] == "native"
+    assert stats["session_cache_scope"] == "transparent_exact_prefix:v1"
+    assert stats["request_session_bank_bypass"] is False
+    assert stats["transparent_exact_prefix_cache"] is True
+    assert captured["session_bank"] is not state.sessions.bank
+    assert callable(getattr(captured["session_bank"], "near_prefix_candidates"))
+    assert callable(
+        getattr(captured["session_bank"], "restore_entry_prefix_cache")
+    )
+    assert captured["session_id"].startswith("transparent-prefix:")
+    assert captured["commit_prompt_prefix_to_bank"] is True
+    assert captured["commit_final_state_to_bank"] is False
+    public_stats = response.json()["mtplx_stats"]
+    assert public_stats["agent_middleware"] == "off"
+    assert public_stats["session_cache_scope"] == "transparent_exact_prefix:v1"
+    assert public_stats["transparent_exact_prefix_cache"] is True
+    assert public_stats["request_session_bank_bypass"] is False
 
 
 def test_opencode_initial_coding_request_uses_compact_mtplx_agent_prompt(monkeypatch):
@@ -3857,7 +4411,7 @@ def test_completion_request_controls_are_server_owned_without_override(monkeypat
     # Server-owned controls resolve to the launch sampler at the prologue
     # (shared RequestPolicy path, same as chat) — the client's 0.01/0.2/1
     # must never reach generation.
-    assert captured["temperature"] == 0.6
+    assert captured["temperature"] == 1.0
     assert captured["top_p"] == 0.95
     assert captured["top_k"] == 20
     stats = captured["request_observability"]
@@ -3875,7 +4429,7 @@ def test_completion_request_controls_are_server_owned_without_override(monkeypat
         "top_p",
         "top_k",
     ]
-    assert stats["effective_temperature"] == 0.6
+    assert stats["effective_temperature"] == 1.0
     assert stats["effective_top_p"] == 0.95
     assert stats["effective_top_k"] == 20
 
@@ -3955,6 +4509,128 @@ class CaptureTokenizer:
         return "".join(chr(int(token)) for token in tokens)
 
 
+class JSONToolPrefixTokenizer(CaptureTokenizer):
+    """Like native Qwen templates, render tools in incoming JSON key order."""
+
+    def apply_chat_template(self, messages, **kwargs):
+        self.calls.append((messages, kwargs))
+        text = json.dumps(kwargs.get("tools") or [], ensure_ascii=False) + "\n"
+        text += "\n".join(
+            f"{message['role']}:{message.get('content') or ''}"
+            for message in messages
+        )
+        if kwargs.get("add_generation_prompt"):
+            text += "\nassistant:"
+        return self.encode(text) if kwargs.get("tokenize", True) else text
+
+
+def test_tool_schema_object_order_does_not_change_rendered_prefix(monkeypatch):
+    monkeypatch.setenv("MTPLX_CHAT_ENCODE_CACHE", "off")
+    tool = {
+        "type": "function",
+        "function": {
+            "name": "lookup",
+            "description": "Look up a value",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string", "description": "Query"}},
+                "required": ["query"],
+            },
+        },
+    }
+
+    def reverse_objects(value):
+        if isinstance(value, dict):
+            return {key: reverse_objects(item) for key, item in reversed(value.items())}
+        if isinstance(value, list):
+            return [reverse_objects(item) for item in value]
+        return value
+
+    prefixes = []
+    for index, spec in enumerate((tool, reverse_objects(tool))):
+        normalized = openai._normalize_tool_specs([spec])
+        assert normalized == [tool]  # No schema fields or values disappear.
+        ids = openai._encode_messages(
+            JSONToolPrefixTokenizer(),
+            [openai.ChatMessage(role="user", content=f"Turn {index}")],
+            enable_thinking=False,
+            tool_prompt_mode="native",
+            tools=normalized,
+        )
+        prefixes.append("".join(map(chr, ids)).split("\n", 1)[0])
+    assert prefixes[0] == prefixes[1]
+
+
+@pytest.mark.parametrize("after_tool", [False, True])
+def test_disabled_tool_turn_contract_is_not_saved_as_client_history(after_tool):
+    messages = [openai.ChatMessage(role="user", content="Explain the result.")]
+    if after_tool:
+        messages += [
+            openai.ChatMessage(role="assistant", content="", tool_calls=[{
+                "id": "lookup-1", "type": "function", "function": {
+                    "name": "session_status", "arguments": "{}",
+                },
+            }]),
+            openai.ChatMessage(role="tool", tool_call_id="lookup-1", content="7"),
+        ]
+    request = openai.ChatCompletionRequest(
+        messages=messages, tools=[_tool_schema()], tool_choice="none"
+    )
+    policy = openai.resolve_request_policy(
+        _fake_state(), request, headers={"x-mtplx-client": "mtplx_app"}, metadata={}
+    )
+    assert len(policy.messages_for_generation) == len(messages) + 1
+    assert "MTPLX " in policy.messages_for_generation[-1].content
+    # The client echoes its own messages, not our request-only instruction.
+    # Banking the suffix as history made a 2,820-token answer replay on the
+    # next native chat turn, despite a successfully stored final snapshot.
+    assert policy.raw_messages_for_postcommit == messages
+    assert policy.prompt_tool_specs == policy.postcommit_tool_specs
+
+
+@pytest.mark.parametrize("client_hint", ["mtplx_app", "opencode", "pi", "hermes"])
+def test_tool_choice_none_keeps_cached_schema_but_disables_calls(monkeypatch, client_hint):
+    state = _fake_state()
+    foreground = ForegroundState()
+    state.lock = foreground.lock
+    state.has_foreground = foreground.has_foreground
+    state.runtime.tokenizer = JSONToolPrefixTokenizer()
+    state.args.stats_footer = False
+    captured = []
+
+    def fake_run_generation(_state, prompt_ids, **kwargs):
+        captured.append((list(prompt_ids), kwargs["session_policy_fingerprint"]))
+        return _fake_generation("The result is available.")
+
+    monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+    client = TestClient(create_app(state))
+    messages = [
+        {"role": "user", "content": "Look up the current value."},
+        {"role": "assistant", "content": "", "tool_calls": [{
+            "id": "lookup-1", "type": "function", "function": {
+                "name": "session_status", "arguments": "{}",
+            },
+        }]},
+        {"role": "tool", "tool_call_id": "lookup-1", "content": "The value is 7."},
+    ]
+    for choice in ("auto", "none"):
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"x-mtplx-cache-mode": "bypass", "x-mtplx-client": client_hint},
+            json={"messages": messages, "tools": [_tool_schema()], "tool_choice": choice},
+        )
+        assert response.status_code == 200
+        if choice == "none":
+            assert not response.json()["choices"][0]["message"].get("tool_calls")
+    prompts = ["".join(map(chr, ids)) for ids, _fingerprint in captured]
+    assert prompts[0].split("\n", 1)[0] == prompts[1].split("\n", 1)[0]
+    # OpenCode's compact lane puts the tool name in its stable digest;
+    # native/hybrid lanes carry the full JSON schema prefix.
+    assert "session_status" in prompts[1]
+    assert captured[0][1] == captured[1][1]
+    assert "MTPLX post-tool answer turn:" in prompts[1]
+
+
 class StepTemplateIgnoringThinkingTokenizer(CaptureTokenizer):
     """Step-like template fixture that always opens <think> on generation."""
 
@@ -3983,6 +4659,220 @@ class ToolSchemaRejectingTokenizer(CaptureTokenizer):
         if "tools" in kwargs:
             raise RuntimeError("rich tool schemas are unsupported")
         return [1, 2, 3]
+
+
+_QWEN38_REASONING_TEMPLATE_SOURCE = "<|think_low|> <|think_xhigh|>"
+
+
+def _qwen38_reasoning_state(*, agent_middleware: str) -> SimpleNamespace:
+    state = _fake_state()
+    state.args.agent_middleware = agent_middleware
+    state.args.model = "Qwen/Qwen3.8-27B"
+    state.args.reasoning = "on"
+    state.args.reasoning_effort = "medium"
+    state.args.temperature = 0.61
+    state.args.top_p = 0.87
+    state.args.top_k = 17
+    state.backend_descriptor = openai.descriptor_for_backend_id("qwen3_next")
+    state.chat_template_profile = "froggeric_v22_1"
+    state.runtime.tokenizer = CaptureTokenizer()
+    state.runtime.tokenizer.chat_template = _QWEN38_REASONING_TEMPLATE_SOURCE
+    return state
+
+
+def _reasoning_capture_generation(captured):
+    def fake_run_generation(_state, _prompt_ids, **kwargs):
+        captured.update(kwargs)
+        return {
+            "text": "ok",
+            "tokens": [4],
+            "stats": {
+                **kwargs["request_observability"],
+                "generation_mode": kwargs["generation_mode"],
+                "mtp_depth": kwargs["depth"],
+                "completion_tokens": 1,
+            },
+            "prompt_tokens": 3,
+            "completion_tokens": 1,
+            "finish_reason": "stop",
+        }
+
+    return fake_run_generation
+
+
+@pytest.mark.parametrize(
+    ("body_controls", "expected_effort", "expected_requested_effort", "source"),
+    [
+        ({"reasoning_effort": "low"}, "low", "low", "top_level"),
+        ({"reasoning_effort": "minimal"}, "low", "minimal", "top_level"),
+        (
+            {"chat_template_kwargs": {"reasoning_effort": "xhigh"}},
+            "xhigh",
+            "xhigh",
+            "chat_template_kwargs",
+        ),
+        (
+            {
+                "reasoning_effort": "high",
+                "chat_template_kwargs": {"reasoning_effort": "low"},
+            },
+            "xhigh",
+            "high",
+            "top_level",
+        ),
+    ],
+)
+def test_transparent_opencode_honors_request_reasoning_effort(
+    monkeypatch, body_controls, expected_effort, expected_requested_effort, source
+):
+    captured: dict[str, object] = {}
+    state = _qwen38_reasoning_state(agent_middleware="off")
+    client = TestClient(create_app(state))
+    monkeypatch.setattr(
+        openai, "_run_generation", _reasoning_capture_generation(captured)
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass", "x-mtplx-client": "opencode"},
+        json={
+            "messages": [{"role": "user", "content": "reason carefully"}],
+            "max_tokens": 4,
+            "temperature": 0.01,
+            "top_p": 0.1,
+            "top_k": 1,
+            **body_controls,
+        },
+    )
+
+    assert response.status_code == 200
+    _messages, template_kwargs = state.runtime.tokenizer.calls[-1]
+    assert template_kwargs["reasoning_effort"] == expected_effort
+    assert captured["temperature"] == state.args.temperature
+    assert captured["top_p"] == state.args.top_p
+    assert captured["top_k"] == state.args.top_k
+    stats = response.json()["mtplx_stats"]
+    assert stats["client_controls_allowed"] is False
+    assert stats["reasoning_controls_allowed"] is True
+    assert stats["reasoning_control_owner"] == "client"
+    assert stats["request_reasoning_effort_resolved"] == expected_effort
+    assert stats["request_reasoning_effort_requested"] == expected_requested_effort
+    assert stats["request_reasoning_effort_source"] == source
+    assert stats["reasoning_effort_template_supported"] is True
+    assert stats["client_control_fields_ignored"] == [
+        "temperature",
+        "top_p",
+        "top_k",
+    ]
+
+
+def test_transparent_opencode_reasoning_none_disables_thinking(monkeypatch):
+    captured: dict[str, object] = {}
+    state = _qwen38_reasoning_state(agent_middleware="off")
+    client = TestClient(create_app(state))
+    monkeypatch.setattr(
+        openai, "_run_generation", _reasoning_capture_generation(captured)
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass", "x-mtplx-client": "opencode"},
+        json={
+            "messages": [{"role": "user", "content": "answer directly"}],
+            "reasoning_effort": "none",
+            "max_tokens": 4,
+        },
+    )
+
+    assert response.status_code == 200
+    _messages, template_kwargs = state.runtime.tokenizer.calls[-1]
+    assert template_kwargs["enable_thinking"] is False
+    assert "reasoning_effort" not in template_kwargs
+    stats = response.json()["mtplx_stats"]
+    assert stats["request_enable_thinking"] is False
+    assert stats["request_reasoning_mode"] == "off"
+    assert stats["request_reasoning_effort_resolved"] is None
+    assert stats["request_reasoning_effort_requested"] == "none"
+    assert stats["request_reasoning_effort_source"] == "top_level"
+
+
+def test_transparent_reasoning_none_conflicts_with_explicit_thinking_on(monkeypatch):
+    state = _qwen38_reasoning_state(agent_middleware="off")
+    client = TestClient(create_app(state))
+    monkeypatch.setattr(
+        openai,
+        "_run_generation",
+        lambda *_args, **_kwargs: pytest.fail("conflicting request must not generate"),
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-client": "opencode"},
+        json={
+            "messages": [{"role": "user", "content": "hi"}],
+            "enable_thinking": True,
+            "reasoning_effort": "none",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "conflicts" in response.json()["error"]["message"]
+
+
+def test_transparent_qwen38_rejects_effort_without_an_effort_aware_template(
+    monkeypatch,
+):
+    state = _qwen38_reasoning_state(agent_middleware="off")
+    state.chat_template_profile = "custom"
+    state.runtime.tokenizer.chat_template = "plain qwen template"
+    client = TestClient(create_app(state))
+    monkeypatch.setattr(
+        openai,
+        "_run_generation",
+        lambda *_args, **_kwargs: pytest.fail("unsupported template must not generate"),
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-client": "opencode"},
+        json={
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "xhigh",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "froggeric_v22_1" in response.json()["error"]["message"]
+
+
+def test_legacy_opencode_middleware_honors_explicit_app_reasoning_control(monkeypatch):
+    captured: dict[str, object] = {}
+    state = _qwen38_reasoning_state(agent_middleware="on")
+    state.args.reasoning_effort = "low"
+    state.args.managed_client_controls = "app"
+    client = TestClient(create_app(state))
+    monkeypatch.setattr(
+        openai, "_run_generation", _reasoning_capture_generation(captured)
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass", "x-mtplx-client": "opencode"},
+        json={
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "xhigh",
+            "max_tokens": 4,
+        },
+    )
+
+    assert response.status_code == 200
+    _messages, template_kwargs = state.runtime.tokenizer.calls[-1]
+    assert template_kwargs["reasoning_effort"] == "low"
+    stats = captured["request_observability"]
+    assert stats["client_controls_allowed"] is False
+    assert stats["request_reasoning_effort"] == "low"
+    assert "reasoning_controls_allowed" not in stats
+    assert stats["client_control_fields_ignored"] == ["reasoning_effort"]
 
 
 class QwenToolHistoryBoundaryTokenizer:
@@ -4244,6 +5134,11 @@ def _stream_payloads(response_text: str) -> list[dict]:
     ]
 
 
+def _sse_frames(response_text: str) -> list[str]:
+    """Non-empty SSE frames in wire order; comment frames start with ':'."""
+    return [frame for frame in response_text.split("\n\n") if frame.strip()]
+
+
 def _anthropic_events(response_text: str) -> list[tuple[str, dict]]:
     events: list[tuple[str, dict]] = []
     for frame in response_text.split("\n\n"):
@@ -4305,7 +5200,7 @@ def test_chat_tools_are_passed_to_qwen_template_and_inherit_default_thinking(
     assert stats["request_reasoning_parser"] == "qwen3"
 
 
-def test_chat_tools_hide_task_when_latest_user_disallows_subagents(monkeypatch):
+def test_chat_tools_hide_task_when_latest_user_disallows_subagents(legacy_rewrites, monkeypatch):
     state = _fake_state()
     state.runtime.tokenizer = CaptureTokenizer()
     state.args.stats_footer = False
@@ -4335,7 +5230,7 @@ def test_chat_tools_hide_task_when_latest_user_disallows_subagents(monkeypatch):
     assert tool_names == ["session_status"]
 
 
-def test_chat_tools_hide_task_by_default_for_direct_project_work(monkeypatch):
+def test_chat_tools_hide_task_by_default_for_direct_project_work(legacy_rewrites, monkeypatch):
     state = _fake_state()
     state.runtime.tokenizer = CaptureTokenizer()
     state.args.stats_footer = False
@@ -4370,7 +5265,7 @@ def test_chat_tools_hide_task_by_default_for_direct_project_work(monkeypatch):
     assert tool_names == ["session_status"]
 
 
-def test_chat_tools_report_filtered_task_names_for_direct_project_work(monkeypatch):
+def test_chat_tools_report_filtered_task_names_for_direct_project_work(legacy_rewrites, monkeypatch):
     seen: dict[str, object] = {}
     state = _fake_state()
     state.runtime.tokenizer = CaptureTokenizer()
@@ -4408,7 +5303,7 @@ def test_chat_tools_report_filtered_task_names_for_direct_project_work(monkeypat
     assert stats["request_tools_hidden_by_bridge"] is True
 
 
-def test_chat_tools_report_no_edit_mutating_tools_hidden(monkeypatch):
+def test_chat_tools_report_no_edit_mutating_tools_hidden(legacy_rewrites, monkeypatch):
     """Generic clients (no coding-agent hint) keep the content-heuristic
     lockdown. OpenCode clients are exempt — see the pass-through test below:
     they curate the toolset per agent mode themselves, and bridge-side hiding
@@ -4548,7 +5443,7 @@ def test_chat_tools_keep_task_when_latest_user_explicitly_requests_subagent(
     assert tool_names == ["session_status", "Task"]
 
 
-def test_chat_tools_keep_todowrite_when_latest_user_explicitly_requests_plan(
+def test_chat_tools_keep_todowrite_when_latest_user_explicitly_requests_plan(legacy_rewrites, 
     monkeypatch,
 ):
     state = _fake_state()
@@ -4659,7 +5554,7 @@ def test_visible_malformed_tool_content_drops_tool_exec_blocks():
     assert visible.strip() == "Let me search.\n\nDone."
 
 
-def test_tool_contract_includes_exact_schema_keys_for_opencode_write(monkeypatch):
+def test_tool_contract_includes_exact_schema_keys_for_opencode_write(legacy_rewrites, monkeypatch):
     state = _fake_state()
     state.runtime.tokenizer = CaptureTokenizer()
     state.args.stats_footer = False
@@ -5061,7 +5956,7 @@ def test_run_generation_can_store_final_state_without_live_cache_ref(monkeypatch
     assert state.sessions.bank.puts[-1]["keep_live_ref"] is False
 
 
-def test_tool_template_schema_failure_retries_with_compact_contract(monkeypatch):
+def test_tool_template_schema_failure_retries_with_compact_contract(legacy_rewrites, monkeypatch):
     state = _fake_state()
     state.runtime.tokenizer = ToolSchemaRejectingTokenizer()
     state.args.stats_footer = False
@@ -5089,6 +5984,37 @@ def test_tool_template_schema_failure_retries_with_compact_contract(monkeypatch)
     assert first_messages == second_messages
     assert "MTPLX tool contract:" in second_messages[0]["content"]
     assert "emit one declared <tool_call> now" in second_messages[0]["content"]
+
+
+def test_transparent_agent_middleware_fails_instead_of_dropping_native_tools(
+    monkeypatch,
+):
+    state = _fake_state()
+    state.args.agent_middleware = "off"
+    state.runtime.tokenizer = ToolSchemaRejectingTokenizer()
+    client = TestClient(create_app(state))
+    monkeypatch.setattr(
+        openai,
+        "_run_generation",
+        lambda *_args, **_kwargs: pytest.fail("encoding must reject first"),
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass", "x-mtplx-client": "opencode"},
+        json={
+            "messages": [{"role": "user", "content": "Use task."}],
+            "tools": [_tool_schema()],
+            "tool_choice": "auto",
+            "enable_thinking": False,
+            "max_tokens": 8,
+        },
+    )
+
+    assert response.status_code == 500
+    assert "does not support native tools" in response.json()["error"]["message"]
+    assert state.runtime.tokenizer.calls
+    assert all("tools" in kwargs for _messages, kwargs in state.runtime.tokenizer.calls)
 
 
 def test_chat_tools_honor_explicit_disable_thinking_with_client_opt_in(monkeypatch):
@@ -5286,7 +6212,6 @@ def test_opencode_simple_chitchat_does_not_retry_or_cook_a_reply(monkeypatch):
             "tool_choice": "auto",
             "stream": True,
             "max_tokens": 64,
-            "enable_thinking": True,
         },
     ) as response:
         body = "".join(response.iter_text())
@@ -5379,14 +6304,12 @@ def test_step_reasoning_off_closes_template_think_prompt_for_managed_clients(
         headers={
             "x-mtplx-cache-mode": "bypass",
             "x-mtplx-client": "opencode",
-            "x-mtplx-allow-client-controls": "1",
         },
         json={
             "messages": [{"role": "user", "content": "hi"}],
             "stream": False,
             "max_tokens": 16,
-            "enable_thinking": True,
-            "reasoning_effort": "high",
+            "temperature": 0.2,
         },
     )
 
@@ -5402,11 +6325,53 @@ def test_step_reasoning_off_closes_template_think_prompt_for_managed_clients(
     assert stats["request_enable_thinking"] is False
     assert stats["request_reasoning_mode"] == "off"
     assert stats["request_enable_thinking_override"] is False
-    assert stats["client_control_fields_ignored"] == [
-        "enable_thinking",
-        "reasoning_effort",
-    ]
+    assert stats["client_control_fields_ignored"] == ["temperature"]
     assert stats["disabled_thinking_prompt_closed"] is True
+
+
+def test_managed_client_thinking_controls_are_honored(monkeypatch):
+    """Managed surfaces keep sampler params server-owned, but their thinking
+    controls (enable_thinking / reasoning_effort) govern the request — the
+    client-side effort picker must actually work (2026-08-21 order)."""
+    captured: dict[str, object] = {}
+    state = _fake_streaming_session_state()
+    state.backend_descriptor = openai.descriptor_for_backend_id("step3p5_mtp")
+    state.args.reasoning = "off"
+    state.args.enable_thinking = False
+    state.args.reasoning_parser = "step3p5"
+    state.args.stats_footer = False
+    client = TestClient(create_app(state))
+
+    def fake_run_generation(_state, prompt_ids, **kwargs):
+        captured["request_observability"] = dict(kwargs["request_observability"])
+        return _fake_generation("hello")
+
+    monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={
+            "x-mtplx-cache-mode": "bypass",
+            "x-mtplx-client": "opencode",
+        },
+        json={
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": False,
+            "max_tokens": 16,
+            "enable_thinking": True,
+            "temperature": 0.2,
+        },
+    )
+
+    assert response.status_code == 200
+    stats = captured["request_observability"]
+    assert stats["mtplx_control_owner"] == "server"
+    assert stats["client_controls_allowed"] is False
+    assert stats["thinking_controls_allowed"] is True
+    assert stats["request_enable_thinking"] is True
+    assert stats["request_reasoning_mode"] == "on"
+    assert stats["request_enable_thinking_override"] is True
+    assert stats["client_control_fields_ignored"] == ["temperature"]
 
 
 def test_step_reasoning_off_strips_orphan_thinks_close_nonstream(monkeypatch):
@@ -5802,6 +6767,104 @@ def test_pi_tool_result_orphan_tool_tail_retries_without_stream_leak(monkeypatch
     assert final[-1]["mtplx_stats"]["raw_tool_markup_suppressed"] is True
 
 
+def test_reasoning_only_turn_that_quotes_tool_markup_is_still_repaired(monkeypatch):
+    """A quoted tool tag is prose, not an attempted call.
+
+    2.11.4 user-seat probe: with tools declared, the model quoted
+    ``</parameter>`` from a pasted traceback a few words into its thinking and
+    then ended the turn. The reasoning-only repair stood down because the raw
+    text contained a tool tag, and the client received an empty message.
+    """
+    state = _fake_streaming_session_state()
+    state.args.stream_interval = 1
+    state.args.stats_footer = False
+    client = TestClient(create_app(state))
+    texts = [
+        "The traceback shows a stray `</parameter>` on line 1785, then `</function>` and `",
+        "Line 1785 is leftover tool markup. Delete the last three lines of the file.",
+    ]
+    calls: list[str] = []
+
+    def fake_run_generation(_state, prompt_ids, **kwargs):
+        text = texts[len(calls)]
+        calls.append(text)
+        tokens = [ord(char) for char in text]
+        token_callback = kwargs.get("token_callback")
+        if token_callback is not None:
+            for token in tokens:
+                token_callback([token])
+        return {
+            "text": text,
+            "tokens": tokens,
+            "stats": {
+                **(kwargs.get("request_observability") or {}),
+                "generation_mode": kwargs["generation_mode"],
+                "mtp_depth": kwargs["depth"],
+                "completion_tokens": len(tokens),
+                "decode_tok_s": 24.0,
+            },
+            "prompt_tokens": len(prompt_ids),
+            "completion_tokens": len(tokens),
+            "finish_reason": "stop",
+        }
+
+    monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass", "x-mtplx-client": "pi"},
+        json={
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Line 1785 of the file is literally </parameter>. What went wrong?",
+                },
+            ],
+            "tools": [_tool_schema()],
+            "tool_choice": "auto",
+            "stream": True,
+            "max_tokens": 128,
+            "enable_thinking": True,
+        },
+    ) as response:
+        body = "".join(response.iter_text())
+
+    assert response.status_code == 200
+    payloads = _stream_payloads(body)
+    reasoning = "".join(
+        choice.get("delta", {}).get("reasoning_content", "")
+        for payload in payloads
+        for choice in payload.get("choices", [])
+    )
+    content = "".join(
+        choice.get("delta", {}).get("content", "")
+        for payload in payloads
+        for choice in payload.get("choices", [])
+    )
+    final = [payload for payload in payloads if payload["choices"][0]["finish_reason"]]
+
+    assert calls == texts
+    assert "`</parameter>`" in reasoning
+    assert "</parameter>" not in content
+    assert content.strip() == texts[1]
+    assert final[-1]["mtplx_stats"]["reasoning_completion_repair_attempted"] is True
+    assert final[-1]["mtplx_stats"]["reasoning_completion_repair_succeeded"] is True
+
+
+def test_attempted_tool_call_still_stands_the_reasoning_repair_down():
+    """The other half of the rule: a call that opens inside thinking, or any
+    tool markup after the thinking block, is an attempt and keeps belonging
+    to the tool-parse fallbacks."""
+    attempts = openai._generated_text_attempts_tool_call
+    common = dict(thinking_enabled=True, start_inside_thinking=True, tool_names=["read"])
+    assert not attempts("The error names `</parameter>` and `</tool_call>`.", **common)
+    assert not attempts("Notes.\n</parameter>\n</function>\n</tool_call>", **common)
+    assert attempts("Reading it.\n<tool_call>\n<function=read>\n<parameter=filePath>", **common)
+    assert attempts("Done thinking.</think>\n\n<function=read>\n<parameter=filePath>", **common)
+    assert attempts("Done thinking.</think>\n\nsrc/Game.ts\n</parameter>\n</function>", **common)
+
+
 def test_pi_tool_result_reasoning_only_final_turn_repairs_without_visible_leak(
     monkeypatch,
 ):
@@ -5908,6 +6971,88 @@ def test_pi_tool_result_reasoning_only_final_turn_repairs_without_visible_leak(
     )
 
 
+def test_tools_declared_first_turn_reasoning_only_stop_repairs_instead_of_empty(
+    monkeypatch,
+):
+    """User report class: tools declared (app web search, agent clients), model
+    stops inside the pre-opened think block on the FIRST turn — no tool-result
+    history exists yet. The F3 reasoning-as-content recovery is deliberately
+    disabled when tools are active, so before the first-turn repair this
+    returned an EMPTY assistant message ("model responds but no answer")."""
+
+    state = _fake_streaming_session_state()
+    state.args.stream_interval = 1
+    state.args.stats_footer = False
+    client = TestClient(create_app(state))
+    texts = [
+        "The user asks for a haiku about tides. Drafting syllables now.",
+        "Moon pulls silver seams\nsalt breath gathers on the rocks\nthe bay exhales light",
+    ]
+    calls: list[str] = []
+    prompts: list[str] = []
+
+    def fake_run_generation(_state, prompt_ids, **kwargs):
+        text = texts[len(calls)]
+        calls.append(text)
+        prompts.append(state.runtime.tokenizer.decode(prompt_ids))
+        tokens = [ord(char) for char in text]
+        token_callback = kwargs.get("token_callback")
+        if token_callback is not None:
+            for token in tokens:
+                token_callback([token])
+        return {
+            "text": text,
+            "tokens": tokens,
+            "stats": {
+                **(kwargs.get("request_observability") or {}),
+                "generation_mode": kwargs["generation_mode"],
+                "mtp_depth": kwargs["depth"],
+                "completion_tokens": len(tokens),
+                "decode_tok_s": 24.0,
+            },
+            "prompt_tokens": len(prompt_ids),
+            "completion_tokens": len(tokens),
+            "finish_reason": "stop",
+        }
+
+    monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "messages": [
+                {"role": "user", "content": "Write a haiku about tides."},
+            ],
+            "tools": [_tool_schema()],
+            "tool_choice": "auto",
+            "stream": True,
+            "max_tokens": 128,
+            "enable_thinking": True,
+        },
+    ) as response:
+        body = "".join(response.iter_text())
+
+    assert response.status_code == 200
+    payloads = _stream_payloads(body)
+    content = "".join(
+        choice.get("delta", {}).get("content", "")
+        for payload in payloads
+        for choice in payload.get("choices", [])
+    )
+    final = [payload for payload in payloads if payload["choices"][0]["finish_reason"]]
+
+    assert calls == texts
+    assert content.strip() == texts[1]
+    assert "</think>" in prompts[1]
+    assert final[-1]["mtplx_stats"]["reasoning_completion_repair_attempted"] is True
+    assert final[-1]["mtplx_stats"]["reasoning_completion_repair_succeeded"] is True
+    assert final[-1]["mtplx_stats"]["reasoning_completion_repair_reason"] == (
+        "tools_declared_reasoning_only_completion"
+    )
+
+
 def test_streaming_tool_call_finishes_without_waiting_for_model_eos(monkeypatch):
     state = _fake_state()
     state.runtime.tokenizer = CaptureTokenizer()
@@ -5952,6 +7097,81 @@ def test_streaming_tool_call_finishes_without_waiting_for_model_eos(monkeypatch)
     assert final[-1]["choices"][0]["finish_reason"] == "tool_calls"
     assert final[-1]["mtplx_stats"]["early_tool_cancel_used"] is True
     assert final[-1]["mtplx_stats"]["tool_parser_source"] == "streaming_translator"
+
+
+def test_early_tool_cancel_survives_a_producer_gap_longer_than_the_queue_poll(
+    monkeypatch,
+):
+    """#343: the loop's own early tool-call cancel must not be read back as a
+    foreign POST /v1/mtplx/cancel. The worker only observes the cancel once
+    per committed token batch, so when that gap outlives the 0.25s queue poll
+    the Empty branch used to see its own cancel_event and kill a healthy
+    tool-calling turn with an error frame."""
+    state = _fake_state()
+    state.runtime.tokenizer = CaptureTokenizer()
+    state.args.stats_footer = False
+    client = TestClient(create_app(state))
+
+    text = (
+        "<tool_call>\n"
+        "<function=session_status>\n"
+        "</function>\n"
+        "</tool_call>"
+        " trailing text that should not stream"
+    )
+    tokens = [ord(char) for char in text]
+
+    def slow_ack_generation(_state, _prompt_ids, **kwargs):
+        token_callback = kwargs.get("token_callback")
+        if token_callback is not None:
+            for token in tokens:
+                token_callback([token])
+        # The reported failure shape (#343): after the complete tool call,
+        # the next committed batch is further away than the grace (0.05s)
+        # plus the stream loop's queue poll (0.25s), so the loop hits Empty
+        # with its own cancel_event already set.
+        time.sleep(1.2)
+        return {
+            "text": text,
+            "tokens": tokens,
+            "stats": {
+                "generation_mode": kwargs["generation_mode"],
+                "mtp_depth": kwargs["depth"],
+                "completion_tokens": len(tokens),
+            },
+            "prompt_tokens": 3,
+            "completion_tokens": len(tokens),
+            "finish_reason": "stop",
+        }
+
+    monkeypatch.setattr(openai, "_run_generation", slow_ack_generation)
+
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "messages": [{"role": "user", "content": "Check status."}],
+            "tools": [_tool_schema()],
+            "tool_choice": "auto",
+            "stream": True,
+            "max_tokens": 256,
+        },
+    ) as response:
+        body = "".join(response.iter_text())
+
+    assert response.status_code == 200
+    assert "request cancelled via POST /v1/mtplx/cancel" not in body
+    payloads = _stream_payloads(body)
+    deltas = [
+        choice.get("delta", {})
+        for payload in payloads
+        for choice in payload.get("choices", [])
+    ]
+    assert any(delta.get("tool_calls") for delta in deltas)
+    final = [payload for payload in payloads if payload["choices"][0]["finish_reason"]]
+    assert final[-1]["choices"][0]["finish_reason"] == "tool_calls"
+    assert final[-1]["mtplx_stats"]["early_tool_cancel_used"] is True
 
 
 def test_streaming_tool_call_canonicalizes_shell_alias_to_bash(monkeypatch):
@@ -6457,7 +7677,7 @@ def test_agent_transcript_canonicalization_strips_opencode_tool_preamble_text():
     assert stats.to_metrics()["transcript_canonicalized"] is True
 
 
-def test_agent_transcript_canonicalization_strips_inspection_tool_preamble_text():
+def test_agent_transcript_canonicalization_strips_inspection_tool_preamble_text(legacy_rewrites):
     tool_call = {
         "id": "call_read",
         "type": "function",
@@ -6486,7 +7706,7 @@ def test_agent_transcript_canonicalization_strips_inspection_tool_preamble_text(
     assert stats.to_metrics()["transcript_canonicalized"] is True
 
 
-def test_agent_transcript_canonicalization_compacts_digested_large_tool_results():
+def test_agent_transcript_canonicalization_compacts_digested_large_tool_results(legacy_rewrites):
     tool_call = {
         "id": "call_read",
         "type": "function",
@@ -6542,7 +7762,7 @@ def test_agent_transcript_canonicalization_compacts_digested_large_tool_results(
     )
 
 
-def test_agent_transcript_canonicalization_keeps_followup_tool_digests_small():
+def test_agent_transcript_canonicalization_keeps_followup_tool_digests_small(legacy_rewrites):
     messages = [
         openai.ChatMessage(
             role="system",
@@ -6602,7 +7822,7 @@ def test_agent_transcript_canonicalization_keeps_followup_tool_digests_small():
     )
 
 
-def test_agent_transcript_canonicalization_compacts_tool_loop_history_before_latest_assistant():
+def test_agent_transcript_canonicalization_compacts_tool_loop_history_before_latest_assistant(legacy_rewrites):
     first_call = {
         "id": "call_grep",
         "type": "function",
@@ -6674,7 +7894,7 @@ def test_agent_transcript_canonicalization_keeps_current_small_non_read_tool_res
     assert stats.to_metrics()["transcript_canonicalized"] is False
 
 
-def test_agent_transcript_canonicalization_compacts_current_large_glob_output():
+def test_agent_transcript_canonicalization_compacts_current_large_glob_output(legacy_rewrites):
     tool_call = {
         "id": "call_glob",
         "type": "function",
@@ -6730,7 +7950,7 @@ def test_agent_transcript_canonicalization_compacts_current_large_glob_output():
     assert metrics["transcript_canonicalized"] is True
 
 
-def test_agent_transcript_canonicalization_adds_read_ranges_for_build_output():
+def test_agent_transcript_canonicalization_adds_read_ranges_for_build_output(legacy_rewrites):
     tool_call = {
         "id": "call_bash",
         "type": "function",
@@ -6790,7 +8010,7 @@ def test_agent_transcript_canonicalization_adds_read_ranges_for_build_output():
     assert stats.to_metrics()["transcript_compacted_active_tool_result_read_hints"] == 3
 
 
-def test_agent_transcript_canonicalization_compacts_current_large_read_outputs():
+def test_agent_transcript_canonicalization_compacts_current_large_read_outputs(legacy_rewrites):
     tool_call = {
         "id": "call_read",
         "type": "function",
@@ -6873,7 +8093,7 @@ def test_agent_transcript_canonicalization_compacts_current_large_read_outputs()
     assert metrics["transcript_compacted_active_read_messages"] == 1
 
 
-def test_agent_transcript_canonicalization_uses_inspection_digest_for_review_reads():
+def test_agent_transcript_canonicalization_uses_inspection_digest_for_review_reads(legacy_rewrites):
     tool_call = {
         "id": "call_read",
         "type": "function",
@@ -6948,7 +8168,7 @@ def test_agent_transcript_canonicalization_uses_inspection_digest_for_review_rea
     assert metrics["transcript_canonical_message_chars"] < 3_000
 
 
-def test_agent_transcript_canonicalization_spreads_full_file_inspection_anchors():
+def test_agent_transcript_canonicalization_spreads_full_file_inspection_anchors(legacy_rewrites):
     tool_call = {
         "id": "call_read",
         "type": "function",
@@ -7080,7 +8300,7 @@ def test_agent_transcript_canonicalization_spreads_full_file_inspection_anchors(
     assert stats.compacted_active_read_inspection_messages == 1
 
 
-def test_agent_transcript_canonicalization_compacts_plain_read_tool_output():
+def test_agent_transcript_canonicalization_compacts_plain_read_tool_output(legacy_rewrites):
     tool_call = {
         "id": "call_read",
         "type": "function",
@@ -7144,7 +8364,7 @@ def test_agent_transcript_canonicalization_compacts_plain_read_tool_output():
     assert stats.compacted_active_read_inspection_messages == 1
 
 
-def test_agent_transcript_canonicalization_collapses_repeated_inspection_reads():
+def test_agent_transcript_canonicalization_collapses_repeated_inspection_reads(legacy_rewrites):
     first_call = {
         "id": "call_read_1",
         "type": "function",
@@ -7223,7 +8443,7 @@ def test_agent_transcript_canonicalization_collapses_repeated_inspection_reads()
     assert metrics["transcript_canonical_message_chars"] < 5_000
 
 
-def test_agent_transcript_canonicalization_budgets_multi_file_inspection_reads():
+def test_agent_transcript_canonicalization_budgets_multi_file_inspection_reads(legacy_rewrites):
     messages = [
         openai.ChatMessage(
             role="user",
@@ -7310,7 +8530,7 @@ def test_agent_transcript_canonicalization_budgets_multi_file_inspection_reads()
     assert metrics["transcript_canonical_message_chars"] < 18_000
 
 
-def test_agent_transcript_canonicalization_compacts_truncated_read_continuation_hints():
+def test_agent_transcript_canonicalization_compacts_truncated_read_continuation_hints(legacy_rewrites):
     tool_call = {
         "id": "call_read",
         "type": "function",
@@ -7367,7 +8587,62 @@ def test_agent_transcript_canonicalization_compacts_truncated_read_continuation_
     )
 
 
-def test_agent_transcript_canonicalization_drops_verbatim_source_dump_assistant_history():
+def test_active_read_compact_threshold_env_override(monkeypatch):
+    body_lines = [f"{line_no}: source line {line_no};" for line_no in range(1, 328)]
+    read_output = (
+        "<path>main.c</path>\n"
+        "<type>file</type>\n"
+        "<content>\n" + "\n".join(body_lines) + "\n</content>"
+    )
+    assert len(read_output) > openai._ACTIVE_READ_COMPACT_THRESHOLD_CHARS
+
+    # #282 default: passthrough — the compactor never runs unless enabled.
+    assert (
+        openai._compact_active_read_tool_result_text(
+            read_output, inspection_request=False
+        )
+        is None
+    )
+
+    # Legacy machinery restores the historical threshold.
+    monkeypatch.setenv("MTPLX_AGENT_REWRITES", "on")
+    compacted = openai._compact_active_read_tool_result_text(
+        read_output, inspection_request=False
+    )
+    assert compacted is not None
+    assert compacted.startswith("<mtplx_compacted_active_read_output")
+    monkeypatch.delenv("MTPLX_AGENT_REWRITES")
+
+    # An explicit env limit engages this one compactor at that limit.
+    monkeypatch.setenv("MTPLX_ACTIVE_READ_COMPACT_THRESHOLD_CHARS", "1000")
+    compacted = openai._compact_active_read_tool_result_text(
+        read_output, inspection_request=False
+    )
+    assert compacted is not None
+
+    # A high explicit limit leaves the content untouched.
+    monkeypatch.setenv(
+        "MTPLX_ACTIVE_READ_COMPACT_THRESHOLD_CHARS", str(100_000_000)
+    )
+    assert (
+        openai._compact_active_read_tool_result_text(
+            read_output, inspection_request=False
+        )
+        is None
+    )
+
+    # off is a hard passthrough guarantee: it beats an explicit low limit.
+    monkeypatch.setenv("MTPLX_ACTIVE_READ_COMPACT_THRESHOLD_CHARS", "1000")
+    monkeypatch.setenv("MTPLX_AGENT_REWRITES", "off")
+    assert (
+        openai._compact_active_read_tool_result_text(
+            read_output, inspection_request=False
+        )
+        is None
+    )
+
+
+def test_agent_transcript_canonicalization_drops_verbatim_source_dump_assistant_history(legacy_rewrites):
     source_dump = "\n".join(
         f"{line_no}: const copiedLine{line_no} = {line_no};"
         for line_no in range(91, 170)
@@ -7391,7 +8666,7 @@ def test_agent_transcript_canonicalization_drops_verbatim_source_dump_assistant_
     assert metrics["transcript_canonicalized"] is True
 
 
-def test_agent_transcript_canonicalization_strips_inspection_tool_call_preambles():
+def test_agent_transcript_canonicalization_strips_inspection_tool_call_preambles(legacy_rewrites):
     tool_call = {
         "id": "call_read",
         "type": "function",
@@ -7429,7 +8704,7 @@ def test_agent_transcript_canonicalization_strips_inspection_tool_call_preambles
     assert stats.to_metrics()["transcript_canonicalized"] is True
 
 
-def test_agent_transcript_canonicalization_skips_repeated_assistant_text():
+def test_agent_transcript_canonicalization_skips_repeated_assistant_text(legacy_rewrites):
     repeated = (
         "Let me continue:\nWrite the Sky, Game, and utils files\n"
         "Run the typecheck\nRun the dev server\n"
@@ -7448,7 +8723,7 @@ def test_agent_transcript_canonicalization_skips_repeated_assistant_text():
     assert stats.skipped_repeated_assistant_messages == 1
 
 
-def test_agent_transcript_canonicalization_skips_stalled_tool_preamble():
+def test_agent_transcript_canonicalization_skips_stalled_tool_preamble(legacy_rewrites):
     first_tool = {
         "id": "call_bash",
         "type": "function",
@@ -7551,7 +8826,7 @@ def test_agent_transcript_canonicalization_drops_duplicate_user_after_abort():
     assert stats.to_metrics()["transcript_canonicalized"] is True
 
 
-def test_agent_transcript_canonicalization_drops_orphan_chitchat_assistant():
+def test_agent_transcript_canonicalization_drops_orphan_chitchat_assistant(legacy_rewrites):
     canonical, stats = openai._canonicalize_agent_transcript(
         [
             openai.ChatMessage(role="user", content="hey"),
@@ -7640,7 +8915,7 @@ def test_agent_transcript_canonicalization_collapses_short_repeated_chitchat():
     assert stats.to_metrics()["transcript_canonicalized"] is True
 
 
-def test_agent_transcript_canonicalization_marks_repeated_shell_timeouts():
+def test_agent_transcript_canonicalization_marks_repeated_shell_timeouts(legacy_rewrites):
     tool_call = {
         "id": "call_tsc_1",
         "type": "function",
@@ -7688,7 +8963,7 @@ def test_agent_transcript_canonicalization_marks_repeated_shell_timeouts():
     assert stats.compacted_repeated_timeout_tool_messages == 1
 
 
-def test_tool_contract_stabilizes_tool_schema_with_agent_tail_guardrail():
+def test_tool_contract_stabilizes_tool_schema_with_agent_tail_guardrail(legacy_rewrites):
     messages = [{"role": "user", "content": "status?"}]
 
     with_contract = openai._with_mtplx_tool_contract(
@@ -7714,7 +8989,7 @@ def test_tool_contract_stabilizes_tool_schema_with_agent_tail_guardrail():
     assert [message["role"] for message in with_contract] == ["system", "user"]
 
 
-def test_native_tool_prompt_mode_keeps_template_tools_and_adds_agent_tail():
+def test_native_tool_prompt_mode_keeps_template_tools_and_adds_agent_tail(legacy_rewrites):
     tokenizer = CaptureTokenizer()
     observability: dict[str, object] = {}
 
@@ -7738,6 +9013,55 @@ def test_native_tool_prompt_mode_keeps_template_tools_and_adds_agent_tail():
     assert "emit one declared <tool_call> now" in rendered_content
     assert "MTPLX tool-result continuation:" not in rendered_content
     assert observability["native_agent_tail_contract_active"] is True
+
+
+def test_transparent_agent_middleware_preserves_full_tool_inventory_without_injections():
+    tokenizer = CaptureTokenizer()
+
+    def long_tool(name: str) -> dict[str, object]:
+        return {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": "long schema " * 120,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "payload": {"type": "string", "description": "x" * 400},
+                    },
+                    "required": ["payload"],
+                },
+            },
+        }
+
+    tools = [long_tool(f"tool_{index}") for index in range(42)]
+    tools.append(long_tool("task"))
+    tool_output = "line\n" * 4_000
+
+    openai._encode_messages(
+        tokenizer,
+        [
+            openai.ChatMessage(role="system", content="OpenCode system message"),
+            openai.ChatMessage(role="developer", content="OpenCode developer message"),
+            openai.ChatMessage(role="user", content="Use task now"),
+            openai.ChatMessage(role="tool", tool_call_id="call_1", content=tool_output),
+        ],
+        enable_thinking=True,
+        add_generation_prompt=True,
+        tools=tools,
+        tool_prompt_mode="compact",
+        agent_middleware=False,
+    )
+
+    messages, kwargs = tokenizer.calls[-1]
+    rendered_content = "\n".join(
+        str(message.get("content") or "") for message in messages
+    )
+    assert kwargs["tools"] == tools
+    assert kwargs["tools"][-1]["function"]["name"] == "task"
+    assert messages[-1]["content"] == tool_output
+    assert "MTPLX " not in rendered_content
+    assert "<mtplx_compacted_" not in rendered_content
 
 
 def test_native_tool_prompt_mode_suppresses_agent_tail_for_chitchat():
@@ -7764,7 +9088,7 @@ def test_native_tool_prompt_mode_suppresses_agent_tail_for_chitchat():
     assert observability["native_agent_tail_contract_active"] is False
 
 
-def test_native_tool_prompt_mode_uses_continuation_hint_after_tool_result():
+def test_native_tool_prompt_mode_uses_continuation_hint_after_tool_result(legacy_rewrites):
     tokenizer = CaptureTokenizer()
     observability: dict[str, object] = {}
 
@@ -7822,7 +9146,7 @@ def test_native_tool_prompt_mode_uses_continuation_hint_after_tool_result():
     assert observability["native_agent_tail_contract_active"] is False
 
 
-def test_hybrid_tool_prompt_mode_keeps_legacy_contract_for_rollback():
+def test_hybrid_tool_prompt_mode_keeps_legacy_contract_for_rollback(legacy_rewrites):
     tokenizer = CaptureTokenizer()
 
     openai._encode_messages(
@@ -7845,7 +9169,7 @@ def test_hybrid_tool_prompt_mode_keeps_legacy_contract_for_rollback():
     assert '{"name":' not in rendered_content
 
 
-def test_compact_tool_prompt_mode_omits_native_template_tools():
+def test_compact_tool_prompt_mode_omits_native_template_tools(legacy_rewrites):
     tokenizer = CaptureTokenizer()
 
     openai._encode_messages(
@@ -7869,6 +9193,52 @@ def test_compact_tool_prompt_mode_omits_native_template_tools():
         "bash(command:string, description:string, timeout?:number)" in rendered_content
     )
     assert "read()" in rendered_content
+
+
+def test_compact_tool_contract_keeps_a_late_task_tool_in_the_allowlist():
+    tokenizer = CaptureTokenizer()
+
+    def long_tool(name: str) -> dict[str, object]:
+        return {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": "long schema " * 120,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        f"payload_{index}": {"type": "string"}
+                        for index in range(12)
+                    },
+                    "required": [f"payload_{index}" for index in range(12)],
+                },
+            },
+        }
+
+    tools = [long_tool(f"tool_{index}") for index in range(42)]
+    tools.append(long_tool("task"))
+
+    contract = openai._mtplx_tool_contract_text(tools)
+
+    declared = contract.split("Declared tools and schemas: ", 1)[1].split(". Call only", 1)[0]
+    assert "task" in declared.split("; ")
+    assert "tool_0(payload_0:string" in declared
+
+    openai._encode_messages(
+        tokenizer,
+        [openai.ChatMessage(role="user", content="Use task")],
+        enable_thinking=True,
+        add_generation_prompt=True,
+        tools=tools,
+        tool_prompt_mode="compact",
+    )
+    messages, kwargs = tokenizer.calls[-1]
+    rendered_content = "\n".join(
+        str(message.get("content") or "") for message in messages
+    )
+    assert "tools" not in kwargs
+    rendered_declared = rendered_content.split("Declared tools and schemas: ", 1)[1].split(". Call only", 1)[0]
+    assert "task" in rendered_declared.split("; ")
 
 
 def test_compact_tool_prompt_mode_still_validates_real_tool_schema():
@@ -7909,6 +9279,51 @@ def test_froggeric_template_profile_applies_from_vendored_file():
     assert "<function=example_function_name>" in tokenizer.chat_template
 
 
+def test_froggeric_v22_template_profile_applies_reasoning_effort_template():
+    tokenizer = SimpleNamespace(chat_template="official")
+    args = SimpleNamespace(
+        chat_template_profile="froggeric_v22_1", chat_template_path=None
+    )
+
+    report = openai._apply_chat_template_profile(tokenizer, args)
+
+    assert report["profile"] == "froggeric_v22_1"
+    assert report["source"] == "file"
+    assert report["applied"] is True
+    assert 'template_version = "qwen3.8-froggeric-v22.1"' in tokenizer.chat_template
+    assert "<|think_xhigh|>" in tokenizer.chat_template
+    assert "<|think_low|>" in tokenizer.chat_template
+
+
+@pytest.mark.parametrize(
+    ("effort", "expected", "forbidden"),
+    [
+        ("low", "Reasoning effort is set to low.", "xhigh"),
+        ("medium", "<|im_start|>assistant\n<think>\n", "Reasoning effort is set"),
+        ("xhigh", "Reasoning effort is set to xhigh.", "set to low"),
+        ("none", "<|im_start|>assistant\n<think>\n\n</think>\n\n", "Reasoning effort is set"),
+    ],
+)
+def test_froggeric_v22_template_renders_qwen38_reasoning_effort(
+    effort, expected, forbidden
+):
+    from jinja2 import Environment
+
+    path = openai._chat_template_profile_path("froggeric_v22_1")
+    assert path is not None
+    template = Environment().from_string(path.read_text(encoding="utf-8"))
+
+    rendered = template.render(
+        messages=[{"role": "user", "content": "ping"}],
+        add_generation_prompt=True,
+        enable_thinking=True,
+        reasoning_effort=effort,
+    )
+
+    assert expected in rendered
+    assert forbidden not in rendered
+
+
 def test_tool_contract_suppresses_agent_tail_for_simple_chitchat():
     with_contract = openai._with_mtplx_tool_contract(
         [{"role": "user", "content": "hi how are you"}],
@@ -7932,7 +9347,7 @@ def test_filter_tool_specs_preserves_tools_for_simple_chitchat():
     assert filtered == tools
 
 
-def test_filter_tool_specs_keeps_only_file_tools_for_static_read_only_review():
+def test_filter_tool_specs_keeps_only_file_tools_for_static_read_only_review(legacy_rewrites):
     tools = [
         _bash_tool_schema(),
         _write_tool_schema(),
@@ -8062,7 +9477,7 @@ def test_filter_tool_specs_passes_through_when_client_manages_tools():
     assert filtered == tools
 
 
-def test_filter_tool_specs_client_managed_still_honors_explicit_no_tools():
+def test_filter_tool_specs_client_managed_still_honors_explicit_no_tools(legacy_rewrites):
     tools = [_bash_tool_schema(), _named_tool_schema("read")]
 
     filtered = openai._filter_tool_specs_for_request(
@@ -8122,7 +9537,7 @@ def test_active_read_only_phase_still_hides_mutating_tools_for_generic_clients()
     assert openai._request_disallows_file_mutation(messages) is True
 
 
-def test_filter_tool_specs_keeps_upgrade_recommendations_read_only():
+def test_filter_tool_specs_keeps_upgrade_recommendations_read_only(legacy_rewrites):
     tools = [
         _bash_tool_schema(),
         _write_tool_schema(),
@@ -8197,7 +9612,7 @@ def test_filter_tool_specs_keeps_bash_when_static_review_requests_tests():
     assert filtered == tools
 
 
-def test_filter_tool_specs_hides_file_mutation_tools_when_user_says_no_edits():
+def test_filter_tool_specs_hides_file_mutation_tools_when_user_says_no_edits(legacy_rewrites):
     tools = [
         _bash_tool_schema(),
         _write_tool_schema(),
@@ -8230,7 +9645,7 @@ def test_filter_tool_specs_hides_file_mutation_tools_when_user_says_no_edits():
     ] == ["bash", "read"]
 
 
-def test_filter_tool_specs_keeps_shallow_inventory_in_lean_read_only_lane():
+def test_filter_tool_specs_keeps_shallow_inventory_in_lean_read_only_lane(legacy_rewrites):
     tools = [
         _bash_tool_schema(),
         _write_tool_schema(),
@@ -8262,7 +9677,7 @@ def test_filter_tool_specs_keeps_shallow_inventory_in_lean_read_only_lane():
     ] == ["bash", "read"]
 
 
-def test_filter_tool_specs_keeps_discovery_tools_for_broad_no_edit_review():
+def test_filter_tool_specs_keeps_discovery_tools_for_broad_no_edit_review(legacy_rewrites):
     tools = [
         _bash_tool_schema(),
         _write_tool_schema(),
@@ -8296,7 +9711,7 @@ def test_filter_tool_specs_keeps_discovery_tools_for_broad_no_edit_review():
     ] == ["bash", "read", "glob", "grep"]
 
 
-def test_filter_tool_specs_keeps_web_and_question_when_requested():
+def test_filter_tool_specs_keeps_web_and_question_when_requested(legacy_rewrites):
     tools = [
         _bash_tool_schema(),
         _write_tool_schema(),
@@ -8441,7 +9856,7 @@ def test_laguna_opencode_keeps_poolside_native_tool_protocol(monkeypatch):
 
 
 @pytest.mark.parametrize("client_hint", ["pi", "hermes"])
-def test_agent_tool_clients_repair_native_launch_mode_to_hybrid(
+def test_agent_tool_clients_repair_native_launch_mode_to_hybrid(legacy_rewrites, 
     monkeypatch, client_hint
 ):
     seen: dict[str, object] = {}
@@ -8566,7 +9981,7 @@ def test_opencode_chitchat_preserves_agent_tools_without_direct_reply_contract(
     assert stats["opencode_prompt_contract_profile"] == "opencode_agent"
     assert stats["transcript_replaced_client_system_messages"] == 0
     assert stats["sampler_policy"] == "opencode_default_sampler"
-    assert stats["effective_temperature"] == 0.6
+    assert stats["effective_temperature"] == 1.0
     assert stats["effective_top_p"] == 0.95
     assert stats["effective_top_k"] == 20
     # F9: server-injected sampler normalization is launch_default OWNERSHIP,
@@ -8612,10 +10027,10 @@ def test_chat_tools_add_no_tool_contract_when_non_chitchat_disables_tools(monkey
     )
 
     assert response.status_code == 200
-    messages, kwargs = state.runtime.tokenizer.calls[0]
+    messages, _kwargs = state.runtime.tokenizer.calls[0]
     rendered = "\n".join(str(message.get("content") or "") for message in messages)
     stats = seen["request_observability"]
-    assert "tools" not in kwargs
+    assert stats["request_filtered_tool_count"] == 0
     assert "MTPLX direct reply turn:" in rendered
     assert "Start with the final user-facing answer" in rendered
     assert stats["no_tools_contract_active"] is True
@@ -8695,7 +10110,8 @@ def test_final_round_after_tools_gets_post_tool_answer_contract(monkeypatch):
     messages, kwargs = state.runtime.tokenizer.calls[0]
     rendered = "\n".join(str(message.get("content") or "") for message in messages)
     stats = seen["request_observability"]
-    assert "tools" not in kwargs
+    assert [tool["function"]["name"] for tool in kwargs["tools"]] == ["web_search"]
+    assert stats["request_filtered_tool_count"] == 0
     assert "MTPLX post-tool answer turn:" in rendered
     assert "Match the depth the user asked for" in rendered
     # The model must be anchored to today and told fresher tool results
@@ -8711,7 +10127,7 @@ def test_final_round_after_tools_gets_post_tool_answer_contract(monkeypatch):
     assert stats["tool_contract_policy_version"] == "post_tool_full_answer:dated:v2"
 
 
-def test_chat_tools_add_no_tool_contract_for_explicit_no_tools_text(monkeypatch):
+def test_chat_tools_add_no_tool_contract_for_explicit_no_tools_text(legacy_rewrites, monkeypatch):
     seen: dict[str, object] = {}
     state = _fake_state()
     foreground = ForegroundState()
@@ -8845,7 +10261,7 @@ def test_chat_tools_add_read_only_force_answer_contract_after_read_budget(monkey
     assert stats["tool_contract_policy_version"].startswith("compact_tool_contract:")
 
 
-def test_explicit_single_tool_then_answer_forces_final_after_tool_result(monkeypatch):
+def test_explicit_single_tool_then_answer_forces_final_after_tool_result(legacy_rewrites, monkeypatch):
     seen: dict[str, object] = {}
     state = _fake_state()
     foreground = ForegroundState()
@@ -8914,7 +10330,7 @@ def test_explicit_single_tool_then_answer_forces_final_after_tool_result(monkeyp
     assert stats["tool_contract_policy_version"] == "read_only_force_answer:v1"
 
 
-def test_opencode_explicit_single_tool_stream_emits_only_first_tool(monkeypatch):
+def test_opencode_explicit_single_tool_stream_emits_only_first_tool(legacy_rewrites, monkeypatch):
     state = _fake_state()
     state.args.stream_interval = 1
     state.args.stats_footer = False
@@ -9083,7 +10499,7 @@ def test_filter_tool_specs_preserves_tools_for_concatenated_simple_chitchat():
         assert filtered == tools
 
 
-def test_filter_tool_specs_drops_tools_when_user_disallows_tools():
+def test_filter_tool_specs_drops_tools_when_user_disallows_tools(legacy_rewrites):
     tools = [_bash_tool_schema(), _tool_schema(), _named_tool_schema("read")]
 
     filtered = openai._filter_tool_specs_for_request(
@@ -9127,7 +10543,7 @@ def test_filter_tool_specs_keeps_for_explicit_tool_choice():
     assert filtered == tools
 
 
-def test_tool_contract_keeps_system_first_for_qwen_template():
+def test_tool_contract_keeps_system_first_for_qwen_template(legacy_rewrites):
     with_contract = openai._with_mtplx_tool_contract(
         [
             {"role": "system", "content": "You are OpenCode."},
@@ -9149,11 +10565,152 @@ def test_tool_contract_honors_forced_function_choice():
         tool_choice={"type": "function", "function": {"name": "submit_answer"}},
     )
 
-    assert "requires the `submit_answer` tool call" in with_contract[0]["content"]
-    assert "instead of a normal text answer" in with_contract[0]["content"]
+    # The forced clause rides a transient trailing user turn, not msg0: a
+    # per-request tool_choice must not change the session's cached prefix
+    # (agent-session gate, 2026-09-03: one forced round re-prefilled 40k
+    # tokens twice). The system contract itself is tool_choice-invariant.
+    assert "requires the" not in with_contract[0]["content"]
+    assert [message["role"] for message in with_contract] == ["system", "user", "user"]
+    tail = with_contract[-1]["content"]
+    assert tail.startswith(openai._MTPLX_FORCED_TOOL_CHOICE_SENTINEL_HEAD)
+    assert "requires the `submit_answer` tool call" in tail
+    assert "instead of a normal text answer" in tail
+    auto = openai._with_mtplx_tool_contract(
+        [{"role": "user", "content": "Solve it."}],
+        tools=[_named_tool_schema("submit_answer")],
+        tool_choice="auto",
+    )
+    assert auto[0]["content"] == with_contract[0]["content"]
+    assert [message["role"] for message in auto] == ["system", "user"]
 
 
-def test_tool_contract_adds_post_tool_continuation_hint_only_after_tool_result():
+def test_forced_tool_choice_sentinel_is_a_registered_transient_suffix():
+    heads = [text[:48] for text in openai._transient_trailing_user_sentinel_texts()]
+    assert openai._MTPLX_FORCED_TOOL_CHOICE_SENTINEL_HEAD[:48] in heads
+    forced = openai._mtplx_forced_tool_choice_text(
+        {"type": "function", "function": {"name": "write"}}
+    )
+    assert forced[:48] == openai._MTPLX_FORCED_TOOL_CHOICE_SENTINEL_HEAD[:48]
+    assert openai._mtplx_forced_tool_choice_text("auto") == (
+        openai._MTPLX_FORCED_TOOL_CHOICE_SENTINEL_HEAD
+    )
+
+
+def test_tool_contract_keeps_every_tool_name_when_over_budget():
+    # Issue #376 (adapted from PR #379 by @ArctifoxNL): enough tools that
+    # the joined "Declared tools and schemas" line exceeds the 1200-char
+    # budget. The sentinel `task` sits at the tail — the old raw byte cut
+    # dropped it entirely, and the "never invent ... undeclared tool"
+    # clause then read the dropped name as "tool missing", killing
+    # subagents in agent clients.
+    tools = []
+    for index in range(20):
+        tools.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": f"tool_{index}",
+                    "description": "x",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            f"prop_{k}": {"type": "string"} for k in range(8)
+                        },
+                        "required": ["prop_0"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        )
+    tools.append(
+        {
+            "type": "function",
+            "function": {
+                "name": "task",
+                "description": "Launch a subagent task.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "description": {"type": "string"},
+                        "prompt": {"type": "string"},
+                    },
+                    "required": ["description", "prompt"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    )
+
+    # Guard: the joined full signatures must exceed the budget so the
+    # fallback path (the code under test) is exercised, not the
+    # under-budget byte-identical path.
+    full = "; ".join(
+        sig for sig in (openai._tool_signature(t) for t in tools) if sig
+    )
+    assert len(full) > 1200
+
+    text = openai._mtplx_tool_contract_text(tools)
+    marker = "Declared tools and schemas: "
+    start = text.find(marker)
+    end = text.find(". Call only these", start)
+    segment = text[start + len(marker) : end]
+
+    for tool in tools:
+        name = tool["function"]["name"]
+        assert re.search(r"\b" + re.escape(name) + r"\b", segment), name
+
+
+def test_anthropic_bridge_forwards_reasoning_effort():
+    # Bridges riding /v1/messages send the flat OpenAI-style field; the
+    # translation dropped it and every family went effort-blind on that
+    # lane (showdown receipt 2026-08-27: low sent, null recorded).
+    request = openai.AnthropicMessagesRequest(
+        model="m",
+        max_tokens=16,
+        messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+        reasoning_effort="low",
+    )
+    chat = openai._anthropic_to_chat_request(request)
+    assert chat.reasoning_effort == "low"
+
+    without = openai.AnthropicMessagesRequest(
+        model="m",
+        max_tokens=16,
+        messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+    )
+    assert openai._anthropic_to_chat_request(without).reasoning_effort is None
+
+
+def test_cancel_attribution_first_origin_wins_and_labels():
+    # #381: one shared cancel event, many setters — the terminal frame
+    # blamed every non-disconnect trip on POST /v1/mtplx/cancel. The first
+    # recorded origin is the one the client is told about.
+    event = openai._AttributedCancelEvent()
+    assert openai._cancel_via_label(event) == "an internal cancellation path"
+    event.set_origin("stop_sequence")
+    event.set_origin("stream_teardown")  # later trips never rewrite history
+    assert event.is_set() and event.origin == "stop_sequence"
+    assert openai._cancel_via_label(event) == "stop-sequence completion"
+
+    from mtplx.server.dashboard_state import InFlightHandle, InFlightRegistry
+
+    post = openai._AttributedCancelEvent()
+    registry = InFlightRegistry()
+    registry.register(
+        InFlightHandle(request_id="r1", cancel_event=post, started_s=0.0)
+    )
+    assert registry.cancel("r1") is True
+    assert post.origin == "post_endpoint" and post.is_set()
+    assert openai._cancel_via_label(post) == "POST /v1/mtplx/cancel"
+
+    plain = Event()  # duck-typed fallback: plain events still just set
+    registry.register(
+        InFlightHandle(request_id="r2", cancel_event=plain, started_s=0.0)
+    )
+    assert registry.cancel("r2") is True and plain.is_set()
+
+
+def test_tool_contract_adds_post_tool_continuation_hint_only_after_tool_result(legacy_rewrites):
     tools = [_bash_tool_schema(), _tool_schema()]
 
     initial = openai._with_mtplx_tool_contract(
@@ -9571,9 +11128,12 @@ def test_read_only_force_answer_stream_postcommit_uses_client_history(monkeypatc
         "glob",
         "grep",
     ]
+    # The force-answer contract is a transient trailing turn; since
+    # 2026-09-03 the fingerprint carries no tail-contract flag at all (a
+    # transition round must reuse the session's banked prefix).
     assert (
-        "read_only_force_answer_contract=0"
-        in captured["generation_final_policy_fingerprint"]
+        "read_only_force_answer_contract"
+        not in captured["generation_final_policy_fingerprint"]
     )
     assert "tool_prompt_mode=compact" in captured["generation_final_policy_fingerprint"]
     assert (
@@ -9585,15 +11145,15 @@ def test_read_only_force_answer_stream_postcommit_uses_client_history(monkeypatc
         not in captured["generation_final_policy_fingerprint"]
     )
     assert (
-        "read_only_force_answer_contract=0"
-        in captured["generation_session_policy_fingerprint"]
+        "read_only_force_answer_contract"
+        not in captured["generation_session_policy_fingerprint"]
     )
     assert (
         "read_only_force_answer:v1"
         not in captured["generation_session_policy_fingerprint"]
     )
     assert (
-        "read_only_force_answer_contract=0" in captured["scheduled_policy_fingerprint"]
+        "read_only_force_answer_contract" not in captured["scheduled_policy_fingerprint"]
     )
     assert "tool_prompt_mode=compact" in captured["scheduled_policy_fingerprint"]
     assert (
@@ -9955,7 +11515,7 @@ def test_postcommit_plain_final_answer_preserves_prior_tool_history_boundaries()
     assert next_turn_prompt[: len(postcommit_prefix)] == postcommit_prefix
 
 
-def test_postcommit_recanonicalizes_raw_active_read_as_next_turn_history():
+def test_postcommit_recanonicalizes_raw_active_read_as_next_turn_history(legacy_rewrites):
     tokenizer = QwenToolHistoryBoundaryTokenizer()
     tools = [_tool_schema()]
     tool_call = {
@@ -10048,7 +11608,7 @@ def test_postcommit_recanonicalizes_raw_active_read_as_next_turn_history():
     assert "<mtplx_compacted_active_read_output" not in rendered_prefix
 
 
-def test_postcommit_read_only_final_matches_next_turn_history_boundary():
+def test_postcommit_read_only_final_matches_next_turn_history_boundary(legacy_rewrites):
     tokenizer = QwenToolHistoryBoundaryTokenizer()
     tools = [_named_tool_schema("read")]
     tool_call = {
@@ -10865,10 +12425,27 @@ def test_chat_stream_tool_call_preamble_is_stored_for_postcommit(monkeypatch):
         }
 
 
-def test_chat_stream_hermes_suppresses_tool_call_preamble(monkeypatch):
+@pytest.mark.parametrize("with_vision", [False, True])
+def test_chat_stream_hermes_suppresses_tool_call_preamble(monkeypatch, with_vision):
     state = _fake_streaming_session_state()
     state.args.stream_interval = 1
     state.args.enable_thinking = False
+    if with_vision:
+        state._vision_spec_cache = SimpleNamespace()
+        splice = SimpleNamespace(
+            image_pad_token_id=999999, image_digests=[123], pad_counts=[1], total_rows=1,
+        )
+        monkeypatch.setattr(openai, "_vision_extract_and_flatten", lambda messages: (messages, [object()]))
+        monkeypatch.setattr(openai, "_materialize_vision_splice", lambda state, images, ids: (ids + [999999], splice))
+    commits = []
+    def capture_final(*_args, **kwargs):
+        commits.append(kwargs)
+        return {"stored": False, "mode": "unsafe", "reason": "tool_call_history_rewrite"}
+    def capture_idle(*_args, **kwargs):
+        commits.append(kwargs)
+        return {"stored": False, "mode": "async_pending"}
+    monkeypatch.setattr(openai, "_store_generation_final_history_snapshot", capture_final)
+    monkeypatch.setattr(openai, "_schedule_idle_postcommit_snapshot", capture_idle)
     monkeypatch.setattr(
         openai,
         "_run_generation",
@@ -10881,7 +12458,7 @@ def test_chat_stream_hermes_suppresses_tool_call_preamble(monkeypatch):
     with TestClient(create_app(state)) as client:
         response = client.post(
             "/v1/chat/completions",
-            headers={"x-mtplx-client": "hermes"},
+            headers={"x-mtplx-client": "hermes", "x-mtplx-session-id": "hermes-preamble"},
             json={
                 "messages": [{"role": "user", "content": "Status."}],
                 "tools": [_tool_schema()],
@@ -10902,6 +12479,14 @@ def test_chat_stream_hermes_suppresses_tool_call_preamble(monkeypatch):
         payload["choices"][0].get("finish_reason") == "tool_calls"
         for payload in payloads
     )
+    assert len(commits) == 2
+    for commit in commits:
+        assert commit["assistant_content"] == ""
+        assert commit["strip_tool_call_preamble_text"] is True
+    if with_vision:
+        # Even the unsafe/idle-postcommit arm must not publish raw image
+        # placeholders as a session frontier that different pixels can adopt.
+        assert state.sessions.peek("hermes-preamble").committed_token_ids == ()
 
 
 def test_chat_stream_hermes_defers_content_until_native_tool_extraction(monkeypatch):
@@ -11297,6 +12882,298 @@ def test_chat_stream_emits_heartbeat_during_alive_silence(monkeypatch):
     assert "data: [DONE]" in response.text
 
 
+def _slow_start_generation(text: str, *, delay_s: float):
+    """Streaming generation stub whose first token arrives after delay_s.
+
+    Stands in for a long silent prefill (#358): the stream loop polls an
+    empty token queue for the whole delay.
+    """
+    tokens = [ord(char) for char in text]
+
+    def fake_run_generation(_state, prompt_ids, **kwargs):
+        time.sleep(delay_s)
+        kwargs["token_callback"](tokens)
+        return {
+            "text": text,
+            "tokens": tokens,
+            "stats": {
+                "generation_mode": kwargs["generation_mode"],
+                "mtp_depth": kwargs["depth"],
+                "completion_tokens": len(tokens),
+            },
+            "prompt_tokens": len(prompt_ids),
+            "completion_tokens": len(tokens),
+            "finish_reason": "stop",
+        }
+
+    return fake_run_generation
+
+
+def test_sse_keepalive_interval_env_parsing(monkeypatch):
+    monkeypatch.delenv("MTPLX_SSE_HEARTBEAT", raising=False)
+    monkeypatch.delenv("MTPLX_SSE_HEARTBEAT_INTERVAL_S", raising=False)
+    assert openai._sse_keepalive_interval_s() == 5.0
+    monkeypatch.setenv("MTPLX_SSE_HEARTBEAT_INTERVAL_S", "2.5")
+    assert openai._sse_keepalive_interval_s() == 2.5
+    # Clamp: sub-second intervals would spam the wire.
+    monkeypatch.setenv("MTPLX_SSE_HEARTBEAT_INTERVAL_S", "0.2")
+    assert openai._sse_keepalive_interval_s() == 1.0
+    monkeypatch.setenv("MTPLX_SSE_HEARTBEAT_INTERVAL_S", "-3")
+    assert openai._sse_keepalive_interval_s() == 1.0
+    # Garbage falls back to the default instead of crashing the stream.
+    monkeypatch.setenv("MTPLX_SSE_HEARTBEAT_INTERVAL_S", "garbage")
+    assert openai._sse_keepalive_interval_s() == 5.0
+    monkeypatch.setenv("MTPLX_SSE_HEARTBEAT", "0")
+    assert openai._sse_keepalive_interval_s() is None
+    monkeypatch.setenv("MTPLX_SSE_HEARTBEAT", "false")
+    assert openai._sse_keepalive_interval_s() is None
+    monkeypatch.setenv("MTPLX_SSE_HEARTBEAT", "1")
+    monkeypatch.delenv("MTPLX_SSE_HEARTBEAT_INTERVAL_S", raising=False)
+    assert openai._sse_keepalive_interval_s() == 5.0
+
+
+def test_chat_stream_emits_sse_keepalive_before_first_token(monkeypatch):
+    state = _fake_state()
+    state.args.stats_footer = False
+    state.generation_executor = ThreadPoolExecutor(max_workers=1)
+    client = TestClient(create_app(state))
+
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    monkeypatch.setenv("MTPLX_SSE_HEARTBEAT_INTERVAL_S", "1")
+    monkeypatch.setattr(
+        openai,
+        "_run_generation",
+        # ~2.5s of pre-first-token silence spans at least two 1s keep-alive
+        # windows even on slow CI runners.
+        _slow_start_generation("ok\n", delay_s=2.5),
+    )
+
+    try:
+        response = client.post(
+            "/v1/chat/completions",
+            headers={
+                "x-mtplx-cache-mode": "bypass",
+                "x-mtplx-allow-client-controls": "1",
+            },
+            json={
+                "messages": [{"role": "user", "content": "Say ok."}],
+                "stream": True,
+                "max_tokens": 16,
+                "enable_thinking": False,
+            },
+        )
+    finally:
+        state.generation_executor.shutdown(wait=True)
+
+    assert response.status_code == 200
+    frames = _sse_frames(response.text)
+    comment_indices = [
+        idx for idx, frame in enumerate(frames) if frame.startswith(":")
+    ]
+    content_indices = [
+        idx
+        for idx, frame in enumerate(frames)
+        if frame.startswith("data: {")
+        and json.loads(frame.removeprefix("data: "))["choices"][0]
+        .get("delta", {})
+        .get("content")
+    ]
+    assert comment_indices, response.text
+    assert frames[comment_indices[0]] == ": keep-alive"
+    assert content_indices, response.text
+    # Scope (#358): comments live only in the silent pre-first-token window.
+    assert comment_indices[-1] < content_indices[0]
+    payloads = _stream_payloads(response.text)
+    content = "".join(
+        payload["choices"][0].get("delta", {}).get("content", "")
+        for payload in payloads
+    )
+    assert content == "ok"
+    assert any(
+        payload["choices"][0].get("finish_reason") == "stop" for payload in payloads
+    )
+    assert "data: [DONE]" in response.text
+
+
+def test_chat_stream_sse_keepalive_kill_switch(monkeypatch):
+    state = _fake_state()
+    state.args.stats_footer = False
+    state.generation_executor = ThreadPoolExecutor(max_workers=1)
+    client = TestClient(create_app(state))
+
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    # Same silent window that provably emits comments above, but disabled.
+    monkeypatch.setenv("MTPLX_SSE_HEARTBEAT", "0")
+    monkeypatch.setenv("MTPLX_SSE_HEARTBEAT_INTERVAL_S", "1")
+    monkeypatch.setattr(
+        openai, "_run_generation", _slow_start_generation("ok\n", delay_s=2.5)
+    )
+
+    try:
+        response = client.post(
+            "/v1/chat/completions",
+            headers={
+                "x-mtplx-cache-mode": "bypass",
+                "x-mtplx-allow-client-controls": "1",
+            },
+            json={
+                "messages": [{"role": "user", "content": "Say ok."}],
+                "stream": True,
+                "max_tokens": 16,
+                "enable_thinking": False,
+            },
+        )
+    finally:
+        state.generation_executor.shutdown(wait=True)
+
+    assert response.status_code == 200
+    assert not [frame for frame in _sse_frames(response.text) if frame.startswith(":")]
+    payloads = _stream_payloads(response.text)
+    content = "".join(
+        payload["choices"][0].get("delta", {}).get("content", "")
+        for payload in payloads
+    )
+    assert content == "ok"
+    assert "data: [DONE]" in response.text
+
+
+def test_chat_stream_fast_start_emits_no_sse_keepalive(monkeypatch):
+    state = _fake_state()
+    state.args.stats_footer = False
+    client = TestClient(create_app(state))
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    monkeypatch.setattr(openai, "_run_generation", _fake_streaming_generation("OK"))
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "messages": [{"role": "user", "content": "Reply OK only."}],
+            "stream": True,
+            "max_tokens": 8,
+        },
+    )
+
+    assert response.status_code == 200
+    assert not [frame for frame in _sse_frames(response.text) if frame.startswith(":")]
+    payloads = _stream_payloads(response.text)
+    content = "".join(
+        payload["choices"][0].get("delta", {}).get("content", "")
+        for payload in payloads
+    )
+    assert content == "OK"
+    assert "data: [DONE]" in response.text
+
+
+def test_completions_stream_emits_sse_keepalive_before_first_token(monkeypatch):
+    state = _fake_streaming_session_state()
+    client = TestClient(create_app(state))
+
+    monkeypatch.setenv("MTPLX_SSE_HEARTBEAT_INTERVAL_S", "1")
+    monkeypatch.setattr(
+        openai, "_run_generation", _slow_start_generation("alpha\n", delay_s=2.5)
+    )
+
+    try:
+        response = client.post(
+            "/v1/completions",
+            json={"prompt": "count", "max_tokens": 8, "stream": True},
+        )
+    finally:
+        state.generation_executor.shutdown(wait=True)
+
+    assert response.status_code == 200
+    frames = _sse_frames(response.text)
+    comment_indices = [
+        idx for idx, frame in enumerate(frames) if frame.startswith(":")
+    ]
+    text_indices = [
+        idx
+        for idx, frame in enumerate(frames)
+        if frame.startswith("data: {")
+        and json.loads(frame.removeprefix("data: "))["choices"][0].get("text")
+    ]
+    # The completions stream has no role-delta preamble at all, so without
+    # the comments the wire is byte-silent for the whole prefill (#358).
+    assert comment_indices, response.text
+    assert frames[comment_indices[0]] == ": keep-alive"
+    assert text_indices, response.text
+    assert comment_indices[-1] < text_indices[0]
+    texts = [
+        payload["choices"][0]["text"]
+        for payload in _stream_payloads(response.text)
+        if payload["choices"][0].get("text")
+    ]
+    assert texts == ["alpha\n"]
+    assert "data: [DONE]" in response.text
+
+
+def test_anthropic_messages_stream_forwards_sse_keepalive(monkeypatch):
+    state = _fake_state()
+    state.args.stats_footer = False
+    state.generation_executor = ThreadPoolExecutor(max_workers=1)
+    client = TestClient(create_app(state))
+
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    monkeypatch.setenv("MTPLX_SSE_HEARTBEAT_INTERVAL_S", "1")
+    monkeypatch.setattr(
+        openai, "_run_generation", _slow_start_generation("ok\n", delay_s=2.5)
+    )
+
+    try:
+        response = client.post(
+            "/v1/messages",
+            headers={
+                "x-mtplx-cache-mode": "bypass",
+                "x-mtplx-allow-client-controls": "1",
+            },
+            json={
+                "model": "mtplx-test-model",
+                "max_tokens": 16,
+                "stream": True,
+                "messages": [{"role": "user", "content": "Say ok."}],
+            },
+        )
+    finally:
+        state.generation_executor.shutdown(wait=True)
+
+    assert response.status_code == 200
+    frames = _sse_frames(response.text)
+    # Raw SSE comments must NOT leak through the Anthropic translator:
+    # Claude Code's stream watchdog ignores them (and drops `ping` events),
+    # so the pre-first-token keep-alives (#358) surface as EMPTY
+    # thinking_delta message events instead (2.10.2).
+    assert not any(frame.startswith(":") for frame in frames), response.text
+    events = _anthropic_events(response.text)
+    event_names = [event for event, _payload in events]
+    assert event_names[0] == "message_start"
+    assert "message_stop" in event_names
+    thinking_keepalive_indices = [
+        idx
+        for idx, (event, payload) in enumerate(events)
+        if event == "content_block_delta"
+        and payload.get("delta", {}).get("type") == "thinking_delta"
+        and payload.get("delta", {}).get("thinking") == ""
+    ]
+    text_delta_indices = [
+        idx
+        for idx, (event, payload) in enumerate(events)
+        if event == "content_block_delta"
+        and payload.get("delta", {}).get("type") == "text_delta"
+    ]
+    # Liveness events flow before the first real token payload.
+    assert thinking_keepalive_indices, response.text
+    assert text_delta_indices, response.text
+    assert thinking_keepalive_indices[0] < text_delta_indices[0]
+    text = "".join(
+        payload.get("delta", {}).get("text", "")
+        for event, payload in events
+        if event == "content_block_delta"
+        and payload.get("delta", {}).get("type") == "text_delta"
+    )
+    assert "ok" in text
+
+
 def test_chat_tools_malformed_tool_call_falls_back_to_content(monkeypatch):
     state = _fake_state()
     state.args.stats_footer = False
@@ -11555,7 +13432,7 @@ def test_chat_stream_missing_required_tool_argument_still_emits_model_tool_call(
 def test_server_state_emits_startup_progress(monkeypatch, capsys):
     monkeypatch.setattr(openai, "apply_profile_env", lambda _profile, **_kwargs: None)
     monkeypatch.setattr(openai, "profile_env_status", lambda _profile, **_kwargs: {})
-    monkeypatch.setattr(openai, "_fast_path_env_status", lambda: {})
+    monkeypatch.setattr(openai, "_fast_path_env_status", lambda **kwargs: {})
     monkeypatch.setattr(openai, "_mlx_runtime_status", lambda: {"ok": True})
     monkeypatch.setattr(
         openai, "_configure_mlx_cache_limit", lambda _args: {"configured": False}
@@ -11606,7 +13483,7 @@ def test_server_state_applies_clear_cache_every_after_profile(monkeypatch):
 
     monkeypatch.setattr(openai, "apply_profile_env", capture_apply_profile_env)
     monkeypatch.setattr(openai, "profile_env_status", capture_profile_env_status)
-    monkeypatch.setattr(openai, "_fast_path_env_status", lambda: {})
+    monkeypatch.setattr(openai, "_fast_path_env_status", lambda **kwargs: {})
     monkeypatch.setattr(openai, "_mlx_runtime_status", lambda: {"ok": True})
     monkeypatch.setattr(
         openai,
@@ -11658,7 +13535,7 @@ def test_server_state_applies_clear_cache_every_after_profile(monkeypatch):
 def _monkeypatch_server_state_load(monkeypatch):
     monkeypatch.setattr(openai, "apply_profile_env", lambda _profile, **_kwargs: None)
     monkeypatch.setattr(openai, "profile_env_status", lambda _profile, **_kwargs: {})
-    monkeypatch.setattr(openai, "_fast_path_env_status", lambda: {})
+    monkeypatch.setattr(openai, "_fast_path_env_status", lambda **kwargs: {})
     monkeypatch.setattr(openai, "_mlx_runtime_status", lambda: {"ok": True})
     monkeypatch.setattr(
         openai, "_configure_mlx_cache_limit", lambda _args: {"configured": False}
@@ -11736,7 +13613,7 @@ def test_server_state_keeps_kv_quant_for_supported_family(monkeypatch):
 def test_server_state_reports_model_load_failure(monkeypatch, capsys):
     monkeypatch.setattr(openai, "apply_profile_env", lambda _profile, **_kwargs: None)
     monkeypatch.setattr(openai, "profile_env_status", lambda _profile, **_kwargs: {})
-    monkeypatch.setattr(openai, "_fast_path_env_status", lambda: {})
+    monkeypatch.setattr(openai, "_fast_path_env_status", lambda **kwargs: {})
     monkeypatch.setattr(openai, "_mlx_runtime_status", lambda: {"ok": True})
     monkeypatch.setattr(
         openai, "_configure_mlx_cache_limit", lambda _args: {"configured": False}
@@ -11763,7 +13640,7 @@ def test_server_state_passes_step_adapter_quant_contract_to_load(monkeypatch):
     captured = {}
     monkeypatch.setattr(openai, "apply_profile_env", lambda _profile, **_kwargs: None)
     monkeypatch.setattr(openai, "profile_env_status", lambda _profile, **_kwargs: {})
-    monkeypatch.setattr(openai, "_fast_path_env_status", lambda: {})
+    monkeypatch.setattr(openai, "_fast_path_env_status", lambda **kwargs: {})
     monkeypatch.setattr(openai, "_mlx_runtime_status", lambda: {"ok": True})
     monkeypatch.setattr(
         openai,
@@ -11849,23 +13726,86 @@ def test_stop_sequence_stream_monitor_holds_back_partial_matches():
     assert flushed.emitted_text == "abc E"
 
 
-def test_chat_stream_stop_sequence_trims_and_cancels_generation(monkeypatch):
-    state = _fake_streaming_session_state()
-    state.args.stream_interval = 1
-    client = TestClient(create_app(state))
-    cancel_seen: dict[str, bool] = {}
+@pytest.fixture(params=[True, False], ids=["during_callback", "after_callback"])
+def _ordered_stop_generation(monkeypatch, request):
+    """Exercise both real cancellation checks without relying on thread timing."""
+    import asyncio
+
+    cancel_during_callback = request.param
+    hello_tokens = [ord(char) for char in "Hello "]
+    stop_tokens = [ord(char) for char in "STOP\n"]
+    cancel_seen: dict[str, object] = {}
+    cancel_events: list[Event] = []
+    queued_tokens: list[list[int]] = []
+    queues = []
+
+    def token_ids(item):
+        if item[0] != "tokens":
+            return None
+        return item[1]["tokens"] if isinstance(item[1], dict) else item[1]
+
+    class OrderedStopQueue(openai._LoopFedStreamQueue):
+        def __init__(self, loop):
+            super().__init__(loop)
+            self.stop_callback_returned = asyncio.Event()
+            queues.append(self)
+
+        def put(self, item):
+            tokens = token_ids(item)
+            if tokens is not None:
+                queued_tokens.append(tokens)
+            super().put(item)
+            if cancel_during_callback and token_ids(item) == stop_tokens:
+                # Let the real consumer cancel before on_tokens performs
+                # its post-put check. Cancellation may unwind this callback.
+                assert cancel_events[0].wait(timeout=10)
+
+        async def get(self, timeout=None):
+            item = await super().get(timeout)
+            if not cancel_during_callback and token_ids(item) == stop_tokens:
+                # Hold only STOP consumption until on_tokens has returned;
+                # the next callback must then trip its pre-put check.
+                await asyncio.wait_for(self.stop_callback_returned.wait(), timeout=10)
+            return item
+
+    monkeypatch.setattr(openai, "_LoopFedStreamQueue", OrderedStopQueue)
 
     def fake_run_generation(_state, _prompt_ids, **kwargs):
         token_callback = kwargs["token_callback"]
         cancel_event = kwargs["cancel_event"]
-        token_callback([ord(char) for char in "Hello "])
-        token_callback([ord(char) for char in "STOP\n"])
-        assert cancel_event.wait(timeout=10), "stop match must cancel generation"
-        cancel_seen["cancelled"] = True
-        token_callback([ord(char) for char in "after"])
-        raise AssertionError("cancelled token callback must raise")
+        cancel_events.append(cancel_event)
+        token_callback(hello_tokens)
+        point = "stop_callback"
+        try:
+            token_callback(stop_tokens)
+            assert not cancel_during_callback, "post-put check must cancel this callback"
+            queues[0]._loop.call_soon_threadsafe(queues[0].stop_callback_returned.set)
+            assert cancel_event.wait(timeout=10), "stop match must cancel generation"
+            point = "later_callback"
+            token_callback([ord(char) for char in "after"])
+            raise AssertionError("cancelled token callback must raise")
+        except openai._StreamCancelled:
+            cancel_seen.update(
+                point=point, cancelled=cancel_event.is_set(), origin=cancel_event.origin
+            )
+            raise
 
     monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+
+    yield
+
+    assert cancel_seen == {
+        "point": "stop_callback" if cancel_during_callback else "later_callback",
+        "cancelled": True,
+        "origin": "stop_sequence",
+    }
+    assert queued_tokens == [hello_tokens, stop_tokens], "no later tokens may be queued"
+
+
+def test_chat_stream_stop_sequence_trims_and_cancels_generation(_ordered_stop_generation):
+    state = _fake_streaming_session_state()
+    state.args.stream_interval = 1
+    client = TestClient(create_app(state))
 
     response = client.post(
         "/v1/chat/completions",
@@ -11892,11 +13832,12 @@ def test_chat_stream_stop_sequence_trims_and_cancels_generation(monkeypatch):
     final = [
         payload for payload in payloads if payload["choices"][0].get("finish_reason")
     ]
+    assert len(final) == 1
     assert final[-1]["choices"][0]["finish_reason"] == "stop"
     assert final[-1]["mtplx_stats"]["stop_sequence_hit"] is True
     assert final[-1]["mtplx_stats"]["stop_sequence_matched"] == "STOP"
-    assert cancel_seen.get("cancelled") is True
-    assert "data: [DONE]" in response.text
+    assert final[-1]["usage"]["completion_tokens"] == len("Hello STOP\n")
+    assert response.text.count("data: [DONE]") == 1
 
 
 def test_chat_stream_stop_sequence_handles_generation_done_race(monkeypatch):
@@ -12128,22 +14069,9 @@ def test_completions_stream_is_incremental_with_terminal_finish_reason(monkeypat
     assert "data: [DONE]" in response.text
 
 
-def test_completions_stream_honors_stop_sequence(monkeypatch):
+def test_completions_stream_honors_stop_sequence(_ordered_stop_generation):
     state = _fake_streaming_session_state()
     client = TestClient(create_app(state))
-    cancel_seen: dict[str, bool] = {}
-
-    def fake_run_generation(_state, _prompt_ids, **kwargs):
-        token_callback = kwargs["token_callback"]
-        cancel_event = kwargs["cancel_event"]
-        token_callback([ord(char) for char in "Hello "])
-        token_callback([ord(char) for char in "STOP\n"])
-        assert cancel_event.wait(timeout=10), "stop match must cancel generation"
-        cancel_seen["cancelled"] = True
-        token_callback([ord(char) for char in "after"])
-        raise AssertionError("cancelled token callback must raise")
-
-    monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
 
     response = client.post(
         "/v1/completions",
@@ -12166,10 +14094,12 @@ def test_completions_stream_honors_stop_sequence(monkeypatch):
     final = [
         payload for payload in payloads if payload["choices"][0].get("finish_reason")
     ]
+    assert len(final) == 1
     assert final[-1]["choices"][0]["finish_reason"] == "stop"
     assert final[-1]["mtplx_stats"]["stop_sequence_hit"] is True
-    assert cancel_seen.get("cancelled") is True
-    assert "data: [DONE]" in response.text
+    assert final[-1]["mtplx_stats"]["stop_sequence_matched"] == "STOP"
+    assert final[-1]["usage"]["completion_tokens"] == len("Hello STOP\n")
+    assert response.text.count("data: [DONE]") == 1
 
 
 def test_completions_nonstream_trims_stop_and_reports_real_finish_reason(
@@ -12451,7 +14381,21 @@ def test_single_tool_call_stream_policy_declared_field_wins():
     assert not policy(
         parallel_tool_calls=True, client_hint="pi", explicit_single_tool=True
     )
-    # Unset falls back to the legacy client-hint heuristics.
+    # #282 default: no hint sniffing — Pi executes every tool call in a
+    # turn, so an undeclared request never gets its stream cut.
+    assert not policy(
+        parallel_tool_calls=None, client_hint="pi", explicit_single_tool=False
+    )
+    assert not policy(
+        parallel_tool_calls=None, client_hint="opencode", explicit_single_tool=True
+    )
+    assert not policy(
+        parallel_tool_calls=None, client_hint="", explicit_single_tool=False
+    )
+
+
+def test_single_tool_call_stream_policy_legacy_hint_sniff(legacy_rewrites):
+    policy = openai._single_tool_call_stream_policy
     assert policy(
         parallel_tool_calls=None, client_hint="pi", explicit_single_tool=False
     )
@@ -12460,9 +14404,6 @@ def test_single_tool_call_stream_policy_declared_field_wins():
     )
     assert not policy(
         parallel_tool_calls=None, client_hint="opencode", explicit_single_tool=False
-    )
-    assert not policy(
-        parallel_tool_calls=None, client_hint="", explicit_single_tool=False
     )
 
 
@@ -12747,3 +14688,505 @@ def test_mtp_postcommit_snapshot_keeps_committed_policy(monkeypatch):
     assert made["mtp_cache"] == 1
     assert result["stored"] is True
     assert state.sessions.bank.puts[0]["mtp_history_policy"] == "committed"
+
+
+def test_strip_client_injected_output_cap_hermes_exact_match_only():
+    from mtplx.server.openai import _strip_client_injected_output_cap
+
+    hermes_headers = {"x-mtplx-client": "hermes"}
+    assert _strip_client_injected_output_cap(
+        65_536, headers=hermes_headers, metadata={}
+    ) == (None, True)
+    # Any other value is a deliberate client choice and must pass through.
+    assert _strip_client_injected_output_cap(
+        65_535, headers=hermes_headers, metadata={}
+    ) == (65_535, False)
+    assert _strip_client_injected_output_cap(
+        None, headers=hermes_headers, metadata={}
+    ) == (None, False)
+    # The same value from any other client is not the hermes injected floor.
+    assert _strip_client_injected_output_cap(
+        65_536, headers={"x-mtplx-client": "opencode"}, metadata={}
+    ) == (65_536, False)
+    assert _strip_client_injected_output_cap(65_536, headers={}, metadata={}) == (
+        65_536,
+        False,
+    )
+
+
+def test_anonymous_coding_agent_tools_cover_hermes_names():
+    from mtplx.server.openai import _anonymous_coding_agent_tool_request
+
+    for name in ("read_file", "write_file", "search_files", "terminal"):
+        assert _anonymous_coding_agent_tool_request([name]), name
+    assert not _anonymous_coding_agent_tool_request(["calendar_lookup"])
+    assert not _anonymous_coding_agent_tool_request([])
+
+
+# ---------------------------------------------------------------------------
+# #282 agent-rewrites contract: the serving endpoints are passthrough by
+# default. These tests pin the DEFAULT (and "off") behavior; the legacy
+# machinery keeps its own pins above via the legacy_rewrites fixture.
+# ---------------------------------------------------------------------------
+
+
+def test_agent_rewrites_mode_resolution(monkeypatch):
+    assert openai._agent_rewrites_mode() == "default"
+    for raw in ("on", "1", "true", "legacy", "ON"):
+        monkeypatch.setenv("MTPLX_AGENT_REWRITES", raw)
+        assert openai._agent_rewrites_mode() == "on"
+    for raw in ("off", "0", "false", "passthrough", "OFF"):
+        monkeypatch.setenv("MTPLX_AGENT_REWRITES", raw)
+        assert openai._agent_rewrites_mode() == "off"
+    monkeypatch.setenv("MTPLX_AGENT_REWRITES", "banana")
+    assert openai._agent_rewrites_mode() == "default"
+
+
+def test_tool_result_compactors_default_off(monkeypatch):
+    big = "x" * 50_000
+    listing = "\n".join(f"src/file_{index}.py:42: match" for index in range(600))
+    assert openai._compact_tool_result_text(big) is None
+    assert openai._compact_active_tool_result_text(listing) is None
+
+    monkeypatch.setenv("MTPLX_AGENT_REWRITES", "on")
+    assert openai._compact_tool_result_text(big) is not None
+    assert openai._compact_active_tool_result_text(listing) is not None
+    monkeypatch.delenv("MTPLX_AGENT_REWRITES")
+
+    # A per-feature env limit engages exactly that compactor.
+    monkeypatch.setenv("MTPLX_TOOL_RESULT_COMPACT_THRESHOLD_CHARS", "1000")
+    assert openai._compact_tool_result_text(big) is not None
+    assert openai._compact_active_tool_result_text(listing) is None
+
+    # off beats explicit per-feature opt-ins.
+    monkeypatch.setenv("MTPLX_AGENT_REWRITES", "off")
+    assert openai._compact_tool_result_text(big) is None
+
+
+def test_filter_tool_specs_passthrough_by_default():
+    tools = [
+        _bash_tool_schema(),
+        _write_tool_schema(),
+        _named_tool_schema("read"),
+        _named_tool_schema("glob"),
+        _named_tool_schema("grep"),
+        _task_tool_schema(),
+        _todowrite_tool_schema(),
+    ]
+    messages = [
+        openai.ChatMessage(
+            role="user",
+            content=(
+                "Evaluate the quality of this project. Inspect the relevant "
+                "files with tools, identify strengths and weaknesses, and "
+                "give a concise improvement plan. Do not edit any files."
+            ),
+        )
+    ]
+    assert openai._filter_tool_specs_for_request(tools, messages) == tools
+
+
+def test_filter_tool_specs_keeps_tools_on_disallow_text_by_default():
+    tools = [_bash_tool_schema(), _named_tool_schema("read")]
+    messages = [
+        openai.ChatMessage(
+            role="user",
+            content="Answer from memory. Do not use tools for this question.",
+        )
+    ]
+    assert openai._filter_tool_specs_for_request(tools, messages) == tools
+
+
+def test_pi_convergence_contract_default_off(monkeypatch):
+    headers = {"x-mtplx-client": "pi"}
+    messages = [openai.ChatMessage(role="user", content="fix the login bug")]
+    messages.extend(
+        openai.ChatMessage(
+            role="tool", tool_call_id=f"call_{index}", content=f"result {index}"
+        )
+        for index in range(20)
+    )
+
+    assert not openai._request_should_add_pi_convergence_contract(
+        messages, headers=headers, metadata={}, tools_active=True
+    )
+
+    monkeypatch.setenv("MTPLX_AGENT_REWRITES", "on")
+    assert openai._request_should_add_pi_convergence_contract(
+        messages, headers=headers, metadata={}, tools_active=True
+    )
+
+    # Explicit env opt-in works without the master switch.
+    monkeypatch.delenv("MTPLX_AGENT_REWRITES")
+    monkeypatch.setenv("MTPLX_PI_CONVERGENCE_AFTER_TOOLS", "2")
+    assert openai._request_should_add_pi_convergence_contract(
+        messages, headers=headers, metadata={}, tools_active=True
+    )
+
+    # off beats the explicit env opt-in.
+    monkeypatch.setenv("MTPLX_AGENT_REWRITES", "off")
+    assert not openai._request_should_add_pi_convergence_contract(
+        messages, headers=headers, metadata={}, tools_active=True
+    )
+
+
+def test_coding_agent_tail_and_hint_default_off(monkeypatch):
+    tools = [
+        _bash_tool_schema(),
+        _named_tool_schema("read"),
+        _named_tool_schema("edit"),
+        _named_tool_schema("write"),
+        _named_tool_schema("grep"),
+        _named_tool_schema("glob"),
+    ]
+    normalized = [{"role": "user", "content": "fix the login bug"}]
+    hint_messages = [
+        {"role": "user", "content": "run the tests"},
+        {"role": "assistant", "content": ""},
+        {"role": "tool", "content": "1 passed"},
+    ]
+
+    assert not openai._should_add_mtplx_coding_agent_tail_contract(
+        normalized, tools=tools
+    )
+    assert openai._mtplx_coding_agent_tail_contract_text(tools) is None
+    assert (
+        openai._append_tool_result_continuation_hint(hint_messages, tools=tools)
+        is False
+    )
+    assert hint_messages[-1]["role"] == "tool"
+
+    monkeypatch.setenv("MTPLX_AGENT_REWRITES", "on")
+    assert openai._should_add_mtplx_coding_agent_tail_contract(
+        normalized, tools=tools
+    )
+    assert openai._mtplx_coding_agent_tail_contract_text(tools) is not None
+    assert (
+        openai._append_tool_result_continuation_hint(hint_messages, tools=tools)
+        is True
+    )
+    assert hint_messages[-1]["role"] == "user"
+
+
+def test_read_only_force_answer_gate(monkeypatch):
+    messages = [
+        openai.ChatMessage(
+            role="user",
+            content=(
+                "Run pytest exactly once and then answer with the failure "
+                "count."
+            ),
+        ),
+        openai.ChatMessage(role="tool", tool_call_id="call_1", content="3 failed"),
+    ]
+    assert not openai._request_should_force_answer_for_read_only_inspection(messages)
+
+    monkeypatch.setenv("MTPLX_AGENT_REWRITES", "on")
+    assert openai._request_should_force_answer_for_read_only_inspection(messages)
+
+    monkeypatch.setenv("MTPLX_AGENT_REWRITES", "off")
+    assert not openai._request_should_force_answer_for_read_only_inspection(messages)
+
+
+def test_canonicalization_preserves_client_messages_by_default():
+    source_dump = "\n".join(
+        f"{line_no}: const copiedLine{line_no} = {line_no};"
+        for line_no in range(91, 170)
+    )
+    tool_call = {
+        "id": "call_check",
+        "type": "function",
+        "function": {"name": "bash", "arguments": "{\"command\": \"sleep 100\"}"},
+    }
+    timeout_text = "Command timed out after 30s"
+    canonical, stats = openai._canonicalize_agent_transcript(
+        [
+            openai.ChatMessage(role="user", content="review the game loop"),
+            openai.ChatMessage(role="assistant", content=source_dump),
+            openai.ChatMessage(
+                role="assistant", content="", tool_calls=[tool_call]
+            ),
+            openai.ChatMessage(
+                role="tool", tool_call_id="call_check", content=timeout_text
+            ),
+            openai.ChatMessage(
+                role="assistant", content="", tool_calls=[dict(tool_call)]
+            ),
+            openai.ChatMessage(
+                role="tool", tool_call_id="call_check", content=timeout_text
+            ),
+        ],
+        tools_active=True,
+    )
+    contents = [str(message.content) for message in canonical]
+    assert source_dump in contents
+    assert contents.count(timeout_text) == 2
+    assert stats.skipped_verbatim_tool_output_assistant_messages == 0
+    assert stats.compacted_repeated_timeout_tool_messages == 0
+
+
+def test_tool_prompt_mode_off_forces_native(monkeypatch):
+    import argparse
+    from types import SimpleNamespace
+
+    args = argparse.Namespace(tool_prompt_mode="hybrid", backend_id=None)
+    monkeypatch.setenv("MTPLX_AGENT_REWRITES", "off")
+    mode, resolution = openai._tool_prompt_mode_for_request(
+        args,
+        headers={"x-mtplx-client": "opencode"},
+        metadata={},
+        tools_active=True,
+        backend=SimpleNamespace(
+            backend_id="test", required_tool_prompt_mode=None
+        ),
+    )
+    assert mode == "native"
+    assert resolution["tool_prompt_mode_source"] == "agent_rewrites_off"
+
+    # A backend-required mode is protocol, not policy: it outranks off.
+    mode, resolution = openai._tool_prompt_mode_for_request(
+        args,
+        headers={},
+        metadata={},
+        tools_active=True,
+        backend=SimpleNamespace(
+            backend_id="test", required_tool_prompt_mode="hybrid"
+        ),
+    )
+    assert mode == "hybrid"
+    assert resolution["tool_prompt_mode_source"] == "backend:test"
+
+
+# ---------------------------------------------------------------------------
+# Memory governor (issue #305): the plan shapes the default window
+
+
+def _memory_plan_state_harness(monkeypatch):
+    """The standard fake-runtime ServerState harness, plus deterministic
+    plan inputs: flagship-sized weights and a monkeypatched machine RAM
+    (CI runners have 7-14 GB; the plan must not depend on the host).
+
+    The plan consumes host RAM through TWO detectors: the seat math reads
+    ``mtplx.memory_plan.detect_total_ram_bytes`` (which each test pins),
+    and the Metal allocator caps read
+    ``openai._detect_total_ram_bytes_for_metal_caps`` whose memory limit
+    then rides into the plan as ``usable_bytes_override``. On a 7 GB CI
+    runner the unpinned second detector collapsed that override to ~5 GiB
+    and the "128G machine" test came back machine-bound at 4096 (this
+    exact set was red on the v2.10.0 release commit). Route the caps
+    detector through the same pinned source so the whole harness follows
+    one simulated seat, and clear the operator cap envs for determinism.
+    """
+    from mtplx import memory_plan as _plan_module
+
+    monkeypatch.setattr(
+        openai,
+        "_detect_total_ram_bytes_for_metal_caps",
+        lambda: (_plan_module.detect_total_ram_bytes(), "test-pin"),
+    )
+    monkeypatch.delenv("MTPLX_MEMORY_LIMIT_BYTES", raising=False)
+    monkeypatch.delenv("MTPLX_WIRED_LIMIT_BYTES", raising=False)
+    monkeypatch.setattr(openai, "apply_profile_env", lambda _profile, **_kwargs: None)
+    monkeypatch.setattr(openai, "profile_env_status", lambda _profile, **_kwargs: {})
+    monkeypatch.setattr(openai, "_fast_path_env_status", lambda **kwargs: {})
+    monkeypatch.setattr(openai, "_mlx_runtime_status", lambda: {"ok": True})
+    monkeypatch.setattr(
+        openai, "_configure_mlx_cache_limit", lambda _args: {"configured": False}
+    )
+    monkeypatch.setattr(
+        openai,
+        "load",
+        lambda model, mtp, contract, **_kwargs: SimpleNamespace(
+            model_path=Path(model),
+            mtp_enabled=mtp,
+            tokenizer=SimpleNamespace(),
+        ),
+    )
+    monkeypatch.setattr(
+        openai, "_install_draft_lm_head", lambda *_args, **_kwargs: {"installed": True}
+    )
+    monkeypatch.setattr(openai, "_draft_head_identity", lambda _runtime: "draft-head")
+    monkeypatch.setattr(openai, "_template_hash", lambda _tokenizer: "template")
+    monkeypatch.setattr(
+        openai, "_resolve_context_window", lambda _tokenizer, _model: 262_144
+    )
+    monkeypatch.setattr(
+        openai, "EngineSessionManager", lambda **_kwargs: SimpleNamespace()
+    )
+    monkeypatch.setattr(
+        "mtplx.engine_session.model_weights_bytes", lambda _path: 21_313_949_792
+    )
+    monkeypatch.delenv("MTPLX_MEMORY_BUDGET", raising=False)
+    monkeypatch.delenv("MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT", raising=False)
+    monkeypatch.delenv("MTPLX_VLLM_METAL_PAGED_KV_QUANT", raising=False)
+    monkeypatch.delenv("MTPLX_PAGED_KV_QUANT", raising=False)
+
+
+def test_server_state_memory_plan_shapes_the_default_window(monkeypatch, capsys):
+    _memory_plan_state_harness(monkeypatch)
+    monkeypatch.setattr(
+        "mtplx.memory_plan.detect_total_ram_bytes", lambda: 48 * 1024**3
+    )
+    args = parse_args(["--model", "models/example", "--warmup-tokens", "0"])
+    state = openai.ServerState(args)
+    # 36G engine budget - 19.85G weights - transients - bank floor:
+    # 196,608 tokens is what actually fits a 48G Mac at full-window KV.
+    assert state.context_window == 196_608
+    assert state.memory_plan.available
+    assert state.memory_plan.context_machine_bound
+    out = capsys.readouterr().out
+    assert "[5/6] Memory plan: 48G Mac" in out
+    assert "machine-bound" in out
+
+
+def test_server_state_explicit_window_wins_but_is_flagged(monkeypatch, capsys):
+    _memory_plan_state_harness(monkeypatch)
+    monkeypatch.setattr(
+        "mtplx.memory_plan.detect_total_ram_bytes", lambda: 48 * 1024**3
+    )
+    args = parse_args(
+        [
+            "--model",
+            "models/example",
+            "--warmup-tokens",
+            "0",
+            "--context-window",
+            "262144",
+        ]
+    )
+    state = openai.ServerState(args)
+    # Explicit user choice is never refused (no strangling) ...
+    assert state.context_window == 262_144
+    # ... but the plan says exactly what it costs.
+    assert state.memory_plan.context_overcommitted
+    out = capsys.readouterr().out
+    assert "OVERCOMMITTED" in out
+    assert "exceeds the machine fit" in out
+
+
+def test_server_state_128g_machine_keeps_the_model_max_window(monkeypatch):
+    _memory_plan_state_harness(monkeypatch)
+    monkeypatch.setattr(
+        "mtplx.memory_plan.detect_total_ram_bytes", lambda: 128 * 1024**3
+    )
+    args = parse_args(["--model", "models/example", "--warmup-tokens", "0"])
+    state = openai.ServerState(args)
+    # The no-regression pin at the integration level: big machines see
+    # zero change from the governor.
+    assert state.context_window == 262_144
+    assert not state.memory_plan.context_machine_bound
+    assert state.memory_plan.bank_idle_max_bytes == 48 * 1024**3
+
+
+def test_server_state_memory_budget_simulates_the_small_seat(monkeypatch, capsys):
+    _memory_plan_state_harness(monkeypatch)
+    monkeypatch.setattr(
+        "mtplx.memory_plan.detect_total_ram_bytes", lambda: 128 * 1024**3
+    )
+    args = parse_args(
+        [
+            "--model",
+            "models/example",
+            "--warmup-tokens",
+            "0",
+            "--memory-budget",
+            "48G",
+        ]
+    )
+    state = openai.ServerState(args)
+    # A 128G dev box declaring --memory-budget 48G resolves the identical
+    # window a real 48G Mac gets — the whole 48G test story hangs on this.
+    assert state.context_window == 196_608
+    assert state.memory_plan.memory_budget_bytes == 48 * 1024**3
+
+
+def test_warmup_rows_stay_out_of_dashboard_metrics_ring():
+    """Warmup generations (startup pass + idle warm ladder) must never
+    become /v1/mtplx/snapshot `latest`: a ladder rung minutes after a real
+    request was replacing that request's receipt, so the app's Live tab
+    lost the user's acceptance counters (2026-08-28 founder report)."""
+    state = SimpleNamespace(last_metrics=[], args=SimpleNamespace(request_log_jsonl=None))
+    openai._record_request_metrics(
+        state, {"request_id": "warm-1", "warmup": True, "completion_tokens": 8}
+    )
+    assert state.last_metrics == []
+    openai._record_request_metrics(
+        state, {"request_id": "real-1", "completion_tokens": 128}
+    )
+    assert [row["request_id"] for row in state.last_metrics] == ["real-1"]
+    openai._record_request_metrics(
+        state, {"request_id": "warm-2", "warmup": True, "completion_tokens": 8}
+    )
+    assert state.last_metrics[-1]["request_id"] == "real-1"
+
+
+def test_fast_path_env_status_treats_runtime_overrides_as_the_expectation(monkeypatch):
+    """Flash-Next pins MTPLX_SKIP_VERIFY_SNAPSHOT=0 and the batched target
+    distributions on purpose; /health must report those keys as ok against
+    the override the server resolved, not against the profile block."""
+    monkeypatch.setenv("MTPLX_SKIP_VERIFY_SNAPSHOT", "0")
+    monkeypatch.setenv("MTPLX_BATCH_TARGET_ARRAYS", "1")
+    monkeypatch.setenv("MTPLX_LAZY_TARGET_DISTRIBUTIONS", "0")
+
+    plain = openai._fast_path_env_status()
+    assert plain["MTPLX_SKIP_VERIFY_SNAPSHOT"]["ok"] is False
+    assert "source" not in plain["MTPLX_SKIP_VERIFY_SNAPSHOT"]
+
+    overrides = {
+        "MTPLX_SKIP_VERIFY_SNAPSHOT": "0",
+        "MTPLX_BATCH_TARGET_ARRAYS": "1",
+        "MTPLX_LAZY_TARGET_DISTRIBUTIONS": "0",
+    }
+    resolved = openai._fast_path_env_status(runtime_env_overrides=overrides)
+    for key, value in overrides.items():
+        assert resolved[key]["ok"] is True, key
+        assert resolved[key]["expected"] == value
+        assert resolved[key]["source"] == "runtime_override"
+        assert resolved[key]["profile_expected"] == openai.FAST_PATH_ENV[key]
+    # keys the server did not override keep the profile expectation
+    assert "source" not in resolved["MTPLX_LAZY_VERIFY_LOGITS"]
+    assert resolved["MTPLX_LAZY_VERIFY_LOGITS"]["expected"] == openai.FAST_PATH_ENV["MTPLX_LAZY_VERIFY_LOGITS"]
+
+
+@pytest.mark.parametrize("hint", ["pi", "opencode", None])
+def test_live_app_ownership_applies_to_actual_request_policy(monkeypatch, hint):
+    from mtplx.backends.descriptors import QWEN3_8_REASONING_CODEC
+
+    state = _fake_state()
+    state.runtime.tokenizer = StreamingTokenizer()
+    state.args.reasoning = "on"
+    state.args.enable_thinking = True
+    state.args.reasoning_effort = "xhigh"
+    state.args.temperature = 1.0
+    state.args.stats_footer = False
+    captured = {}
+    monkeypatch.setattr(openai, "_reasoning_codec_for_state", lambda _state: QWEN3_8_REASONING_CODEC)
+
+    def generate(_state, _prompt_ids, **kwargs):
+        captured.update(kwargs)
+        return _fake_generation("ok")
+
+    monkeypatch.setattr(openai, "_run_generation", generate)
+    client = TestClient(create_app(state))
+    headers = {"x-mtplx-cache-mode": "bypass"}
+    if hint:
+        headers["x-mtplx-client"] = hint
+    body = {
+        "messages": [{"role": "user", "content": "hi"}], "stream": False,
+        "reasoning_effort": "medium", "enable_thinking": True,
+        "temperature": 0.55, "top_p": 1.0,
+    }
+    for policy in ("app", "client", "app"):
+        response = client.post("/v1/mtplx/settings", json={"managed_client_controls": policy})
+        assert response.status_code == 200, response.text
+        assert response.json()["managed_client_controls"] == policy
+        response = client.post("/v1/chat/completions", headers=headers, json=body)
+        assert response.status_code == 200, response.text
+        owned = policy == "app" and hint is not None
+        obs = captured["request_observability"]
+        assert obs["request_reasoning_effort"] == ("xhigh" if owned else "medium")
+        assert captured["temperature"] == (1.0 if owned else 0.55)
+        assert obs["thinking_controls_allowed"] is not owned
+
+    assert client.post("/v1/mtplx/settings", json={"managed_client_controls": "typo"}).status_code == 400
+    assert state.args.managed_client_controls == "app"

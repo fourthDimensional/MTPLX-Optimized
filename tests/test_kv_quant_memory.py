@@ -1,10 +1,11 @@
 """KV-quant memory honesty and per-request numerics routing (F29).
 
 The kv_quant dequant mirror must never invert the feature's memory promise:
-it is offset-sized (not capacity-sized), q8-only (q4 can never reach the q8
-kernel, so a persistent bf16 mirror would sit on top of the quantized store
-for the whole request), released when a request latches the q8-kernel route,
-and it survives quantized-store growth without a full rebuild. Numerics are
+it is offset-sized (not capacity-sized), q8-only (q4 never builds a bf16
+mirror — its kernel route reads the head-major QUANTIZED bank instead, and
+its dequant fallbacks materialize transiently), released when a request
+latches the q8-kernel route, and it survives quantized-store growth without
+a full rebuild. Numerics are
 routed once per request: a request must not hop between kernel math and
 dequant math because its offset crossed the two-pass threshold
 mid-generation (temp-0 exactness). trim() deliberately keeps the latched
@@ -18,7 +19,10 @@ import mlx.core as mx
 import pytest
 
 from mtplx.attention_context import attention_phase
-from mtplx.cache_state import VllmMetalPagedKVCache
+from mtplx.cache_state import (
+    VllmMetalPagedKVCache,
+    install_vllm_metal_paged_attention_kv_cache,
+)
 from mtplx.kv_quant import PagedKVQuantConfig
 
 DIM = 128
@@ -94,8 +98,9 @@ def test_q8_mirror_is_offset_sized_not_capacity_sized(monkeypatch):
 
 
 def test_q4_allocates_no_mirror(monkeypatch):
-    """q4 can never reach the q8 kernel, so a persistent mirror would just
-    stack bf16 on top of the quantized store forever: it must not exist."""
+    """q4 never builds the bf16 mirror (its kernel route reads the quantized
+    bank instead): a persistent bf16 mirror would just stack bf16 on top of
+    the quantized store forever, so it must not exist."""
 
     _skip_without_metal()
     monkeypatch.setenv("MTPLX_KV_QUANT_2PASS_KERNEL", "1")
@@ -304,13 +309,16 @@ def test_kv_quant_route_survives_verify_reject_trim(monkeypatch):
 
 
 def test_kv_quant_route_is_structurally_dequant_when_kernel_cannot_engage(monkeypatch):
-    """q4 and sliding-window layers can never use the q8 kernel: their
-    route latches dequant regardless of offset."""
+    """Kill-switched q4, geometry the packed-quant kernel refuses, and
+    sliding-window layers cannot use a kv_quant kernel: their route latches
+    dequant regardless of offset."""
 
     _skip_without_metal()
     monkeypatch.setenv("MTPLX_KV_QUANT_2PASS_KERNEL", "1")
     monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_ATTN_2PASS_THRESHOLD", "64")
 
+    # q4 with the dedicated kill-switch off: structurally dequant.
+    monkeypatch.setenv("MTPLX_KV_QUANT_Q4_KERNEL", "0")
     q4_cache = _build_cache("q4", block_size=16, num_blocks=16)
     keys, values = _rows(200, seed=808)
     with attention_phase("prefill"):
@@ -320,6 +328,23 @@ def test_kv_quant_route_is_structurally_dequant_when_kernel_cannot_engage(monkey
     assert out is not None
     assert q4_cache.paged_stats()["kv_quant_route"] == "dequant"
     assert q4_cache.kv_quant_kernel_calls == 0
+    monkeypatch.delenv("MTPLX_KV_QUANT_Q4_KERNEL")
+
+    # q4 head_dim outside the packed-quant kernel's {64, 128, 256} set:
+    # structurally dequant even with every switch on.
+    narrow = _build_cache("q4", block_size=16, num_blocks=16)
+    mx.random.seed(818)
+    narrow_keys = 0.5 * mx.random.normal((1, KV_HEADS, 200, 96), dtype=mx.float16)
+    narrow_values = 0.5 * mx.random.normal((1, KV_HEADS, 200, 96), dtype=mx.float16)
+    with attention_phase("prefill"):
+        narrow.update_without_fetch(narrow_keys, narrow_values)
+    mx.random.seed(819)
+    narrow_q = 0.3 * mx.random.normal((1, Q_HEADS, 1, 96), dtype=mx.float16)
+    with attention_phase("ar_decode"):
+        out = narrow.paged_attention(narrow_q, scale=96**-0.5, mask="causal")
+    assert out is not None
+    assert narrow.paged_stats()["kv_quant_route"] == "dequant"
+    assert narrow.kv_quant_kernel_calls == 0
 
     windowed = _build_cache("q8", block_size=16, num_blocks=16)
     with attention_phase("prefill"):
@@ -443,3 +468,133 @@ def test_nbytes_counts_live_mirror_and_only_live_mirror(monkeypatch):
 
     cache._invalidate_dequant_memo()
     assert cache.nbytes == quant_bytes
+
+
+def test_capacity_tracks_pages_not_claim_across_stomps(monkeypatch):
+    """#310: re-configs and snapshot restores stomp num_blocks on live
+    buffers without reallocating. Capacity must stay a fact about the
+    allocated pages — a lying claim skipped the growth guard, fancy-index
+    scatter silently dropped out-of-range rows while the offset advanced,
+    and a later real grow crashed _dequant_active_arrays broadcasting the
+    short mirror into the full-offset one. CPU-only shape test, no Metal."""
+
+    monkeypatch.setenv("MTPLX_DYNAMIC_PAGED_KV", "1")
+    monkeypatch.delenv("MTPLX_CONTEXT_WINDOW_TOKENS", raising=False)
+
+    cache = _build_cache("q8", block_size=16, num_blocks=8)
+    keys, values = _rows(100, seed=310)
+    cache.update_without_fetch(keys, values)
+    warm_k, warm_v = cache._active_arrays()
+    mx.eval(warm_k, warm_v)
+    assert cache.capacity == 128
+
+    # Writer stand-in (install re-config / meta_state restore): raise the
+    # claim without reallocating a single page.
+    cache.num_blocks = 64
+    assert cache.capacity == 128
+
+    tail_k, tail_v = _rows(51, seed=311)
+    cache.update_without_fetch(tail_k, tail_v)  # crosses the physical boundary
+    assert int(cache.offset) == 151
+    assert cache.grow_events == 1
+    got_k, got_v = cache._active_arrays()
+    mx.eval(got_k, got_v)
+    assert int(got_k.shape[2]) == int(cache.offset)  # no silent truncation
+    assert int(got_v.shape[2]) == int(cache.offset)
+    assert cache.capacity == int(cache.key_cache.shape[0]) * int(
+        cache.key_cache.shape[1]
+    )
+
+    # Lower the claim below the grown pages: the next write must neither
+    # re-grow from a stale base nor break the dequant mirror.
+    cache.num_blocks = 8
+    one_k, one_v = _rows(1, seed=312)
+    cache.update_without_fetch(one_k, one_v)
+    got_k, got_v = cache._active_arrays()
+    mx.eval(got_k, got_v)
+    assert int(got_k.shape[2]) == int(cache.offset) == 152
+
+
+def test_q8_mirror_invariant_survives_reconfig(monkeypatch):
+    """memo["tokens"] <= mirror rows and mirror rows >= offset must hold
+    across an install-time re-config of a live cache (#310): the re-config
+    requests room via an explicit grow, it never redefines the pages under
+    the mirror."""
+
+    monkeypatch.setenv("MTPLX_DYNAMIC_PAGED_KV", "1")
+    monkeypatch.delenv("MTPLX_CONTEXT_WINDOW_TOKENS", raising=False)
+
+    cache = _build_cache("q8", block_size=16, num_blocks=8)
+    keys, values = _rows(100, seed=313)
+    cache.update_without_fetch(keys, values)
+    warm_k, warm_v = cache._active_arrays()
+    mx.eval(warm_k, warm_v)
+    memo = cache._dequant_memo
+    assert memo is not None
+    assert int(memo["tokens"]) <= int(memo["mirror_k"].shape[0])
+    assert int(memo["mirror_k"].shape[0]) >= int(cache.offset)
+
+    stats = install_vllm_metal_paged_attention_kv_cache(
+        [cache],
+        block_size=16,
+        num_blocks=64,
+        kv_quant_config=PagedKVQuantConfig("q8"),
+    )
+    assert stats["entries"] == 1
+    assert cache.capacity >= 16 * 64  # room request honored by growing
+    assert cache.capacity == int(cache.key_cache.shape[0]) * int(
+        cache.key_cache.shape[1]
+    )
+
+    tail_k, tail_v = _rows(51, seed=314)
+    cache.update_without_fetch(tail_k, tail_v)
+    got_k, got_v = cache._active_arrays()
+    mx.eval(got_k, got_v)
+    memo = cache._dequant_memo
+    assert memo is not None
+    mirror_rows = int(memo["mirror_k"].shape[0])
+    assert int(memo["tokens"]) <= mirror_rows
+    assert mirror_rows >= int(cache.offset)
+    assert int(got_k.shape[2]) == int(cache.offset) == 151
+
+
+def test_q8_boundary_smoke_pins_16384_to_19295_crossing(monkeypatch):
+    """The reporter's literal crossing (#310): 1024 16-row blocks (16384
+    rows), a stomped claim, then writes landing the offset at 19295.
+    Pre-fix this crashed _dequant_active_arrays broadcasting the 16384-row
+    mirror into the 19295-row one; now the pages grow at the write and the
+    mirror follows. head_dim=8 keeps the int8 store ~0.5MB."""
+
+    monkeypatch.setenv("MTPLX_DYNAMIC_PAGED_KV", "1")
+    monkeypatch.delenv("MTPLX_CONTEXT_WINDOW_TOKENS", raising=False)
+
+    head_dim = 8
+
+    def rows(count: int, seed: int) -> tuple[mx.array, mx.array]:
+        mx.random.seed(seed)
+        keys = 0.5 * mx.random.normal(
+            (1, KV_HEADS, count, head_dim), dtype=mx.float16
+        )
+        values = 0.5 * mx.random.normal(
+            (1, KV_HEADS, count, head_dim), dtype=mx.float16
+        )
+        return keys, values
+
+    cache = _build_cache("q8", block_size=16, num_blocks=1024)
+    keys, values = rows(16384, seed=315)
+    cache.update_without_fetch(keys, values)
+    warm_k, warm_v = cache._active_arrays()
+    mx.eval(warm_k, warm_v)
+    assert cache.capacity == 16384
+
+    cache.num_blocks = 4096  # stomped claim: 65536 rows that do not exist
+    assert cache.capacity == 16384
+
+    tail_k, tail_v = rows(19295 - 16384, seed=316)
+    cache.update_without_fetch(tail_k, tail_v)
+    assert int(cache.offset) == 19295
+    assert cache.grow_events == 1
+    got_k, got_v = cache._active_arrays()
+    mx.eval(got_k, got_v)
+    assert int(got_k.shape[2]) == 19295
+    assert int(got_v.shape[2]) == 19295

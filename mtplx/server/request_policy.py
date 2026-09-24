@@ -29,6 +29,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from mtplx.constants import DEFAULT_TEMPERATURE, DEFAULT_TOP_K, DEFAULT_TOP_P
+from mtplx.reasoning_effort import REASONING_EFFORT_LEVELS
 from mtplx.sampling import SamplerConfig
 
 
@@ -52,6 +53,32 @@ def _srv() -> Any:
     return openai
 
 
+def _responses_reasoning_observability(
+    metadata: dict[str, Any], effective_effort: str | None
+) -> dict[str, Any]:
+    """Report Responses effort only after loaded-family policy resolves it."""
+
+    requested_raw = metadata.get("responses_reasoning_effort_requested")
+    if requested_raw is None:
+        return {}
+    requested = str(requested_raw)
+    if requested not in {"auto", *REASONING_EFFORT_LEVELS}:
+        return {}
+    downgraded = False
+    if requested != "auto" and effective_effort != requested:
+        if effective_effort not in REASONING_EFFORT_LEVELS:
+            downgraded = True
+        else:
+            requested_rank = REASONING_EFFORT_LEVELS.index(requested)
+            effective_rank = REASONING_EFFORT_LEVELS.index(effective_effort)
+            downgraded = effective_rank < requested_rank
+    return {
+        "request_responses_reasoning_effort_requested": requested,
+        "request_responses_reasoning_effort_effective": effective_effort,
+        "request_responses_reasoning_effort_downgraded": downgraded,
+    }
+
+
 @dataclass(frozen=True)
 class RequestPolicy:
     """Resolved per-request policy, immutable for the request's lifetime.
@@ -68,9 +95,12 @@ class RequestPolicy:
     opencode_client: bool = False
     requested_tool_specs: list[dict[str, Any]] = field(default_factory=list)
     tool_specs: list[dict[str, Any]] = field(default_factory=list)
+    model_tool_specs: list[dict[str, Any]] = field(default_factory=list)
     tools_active: bool = False
+    prompt_tool_specs: list[dict[str, Any]] | None = None
     agent_transcript_tools_active: bool = False
     postcommit_tool_specs: list[dict[str, Any]] | None = None
+    agent_middleware_active: bool = True
 
     # Prompt contracts.
     read_only_force_answer_contract_active: bool = False
@@ -93,6 +123,7 @@ class RequestPolicy:
     # Reasoning.
     thinking_enabled: bool = False
     reasoning_effort: str | None = None
+    reasoning_controls_allowed: bool = False
     aime_visible_working: bool = False
 
     # Control ownership.
@@ -189,6 +220,7 @@ def _resolve_sampler(
     telemetry and identical draft-sampler resolution inputs.
     """
     srv = _srv()
+    observability["managed_client_controls"] = srv._managed_client_controls(state)
     if client_controls_allowed:
         srv._reject_non_finite_sampler_controls(request)
     sampler_temperature = request.temperature if client_controls_allowed else None
@@ -223,17 +255,19 @@ def _resolve_sampler(
     ]
     if ignored_sampler_fields:
         observability["client_sampler_fields_ignored"] = ignored_sampler_fields
-    target_sampler_override = srv._opencode_default_sampler_override(
-        messages=messages_for_generation,
-        tools_active=tools_active,
-        request_temperature=request.temperature,
-        request_top_p=request.top_p,
-        request_top_k=request.top_k,
-        request_observability=observability,
-        default_temperature=getattr(state.args, "temperature", DEFAULT_TEMPERATURE),
-        default_top_p=getattr(state.args, "top_p", DEFAULT_TOP_P),
-        default_top_k=getattr(state.args, "top_k", DEFAULT_TOP_K),
-    )
+    target_sampler_override = None
+    if srv._managed_client_controls(state) != "client":
+        target_sampler_override = srv._opencode_default_sampler_override(
+            messages=messages_for_generation,
+            tools_active=tools_active,
+            request_temperature=request.temperature,
+            request_top_p=request.top_p,
+            request_top_k=request.top_k,
+            request_observability=observability,
+            default_temperature=getattr(state.args, "temperature", DEFAULT_TEMPERATURE),
+            default_top_p=getattr(state.args, "top_p", DEFAULT_TOP_P),
+            default_top_k=getattr(state.args, "top_k", DEFAULT_TOP_K),
+        )
     # The OpenCode normalization overrides the TARGET sampler only. The
     # draft sampler is deliberately NOT injected as a request value:
     # server-injected values are launch_default ownership, not
@@ -283,15 +317,26 @@ def _control_ownership_observability(
     request: Any,
     *,
     client_controls_allowed: bool,
+    reasoning_controls_allowed: bool = False,
     observability: dict[str, Any],
+    thinking_controls_allowed: bool | None = None,
 ) -> None:
     srv = _srv()
+    thinking_allowed = (
+        client_controls_allowed
+        if thinking_controls_allowed is None
+        else thinking_controls_allowed
+    )
     observability["mtplx_control_owner"] = (
         "client" if client_controls_allowed else "server"
     )
     observability["client_controls_allowed"] = bool(client_controls_allowed)
+    observability["thinking_controls_allowed"] = bool(thinking_allowed)
     if not client_controls_allowed:
-        ignored_fields = srv._ignored_client_control_fields(request)
+        ignored_fields = srv._ignored_client_control_fields(
+            request,
+            reasoning_controls_allowed=reasoning_controls_allowed,
+        )
         if ignored_fields:
             observability["client_control_fields_ignored"] = ignored_fields
 
@@ -306,7 +351,7 @@ def _resolve_completions_policy(
 ) -> RequestPolicy:
     srv = _srv()
     observability: dict[str, Any] = {}
-    client_controls_allowed = srv._client_controls_allowed(headers, metadata)
+    client_controls_allowed = srv._client_controls_allowed(headers, metadata, state=state)
     request_generation_mode = srv._request_generation_mode_for_generation(
         state,
         request,
@@ -422,8 +467,9 @@ def resolve_request_policy(
     observability: dict[str, Any] = {}
 
     opencode_client = srv._is_opencode_client(headers=headers, metadata=metadata)
+    agent_middleware_active = srv._agent_middleware_enabled_from_args(state.args)
     requested_tool_specs = srv._normalize_tool_specs(request.tools)
-    if chat:
+    if chat and agent_middleware_active:
         tool_specs = srv._filter_tool_specs_for_request(
             requested_tool_specs,
             request.messages,
@@ -454,7 +500,8 @@ def resolve_request_policy(
         )
     )
     read_only_force_answer_contract_active = bool(
-        chat
+        agent_middleware_active
+        and chat
         and srv._request_should_force_answer_for_read_only_inspection(request.messages)
     )
     if read_only_force_answer_contract_active:
@@ -478,8 +525,18 @@ def resolve_request_policy(
             # message carries the "answer now, no more tools" conditioning;
             # prefix stability owns the toolset bytes.
             pass
+    # A per-turn tool prohibition controls execution, not the declared
+    # schema prefix. Keep the same prompt tools on auto -> none -> auto;
+    # the existing trailing no-tool contract closes the tool phase, and
+    # tools_active still governs parsing/emission of calls.
+    prompt_tool_specs = (
+        tool_specs
+        if tools_active or srv._tool_choice_disables_tools(request.tool_choice)
+        else None
+    )
     no_tools_contract_applies = bool(
-        chat
+        agent_middleware_active
+        and chat
         and not read_only_force_answer_contract_active
         and srv._should_add_no_tool_contract(
             requested_tools=requested_tool_specs,
@@ -498,9 +555,16 @@ def resolve_request_policy(
     no_tools_contract_active = bool(
         no_tools_contract_applies and not post_tool_answer_contract_active
     )
-    client_controls_allowed = srv._client_controls_allowed(headers, metadata)
+    client_controls_allowed = srv._client_controls_allowed(headers, metadata, state=state)
+    thinking_controls_allowed = srv._client_thinking_controls_allowed(
+        headers, metadata, state=state
+    )
+    reasoning_controls_allowed = bool(
+        thinking_controls_allowed or not agent_middleware_active
+    )
     pi_convergence_contract_active = bool(
-        chat
+        agent_middleware_active
+        and chat
         and not read_only_force_answer_contract_active
         and not no_tools_contract_active
         and not post_tool_answer_contract_active
@@ -518,7 +582,7 @@ def resolve_request_policy(
             metadata=metadata,
             tool_choice=request.tool_choice,
         )
-        if chat
+        if chat and agent_middleware_active
         else None
     )
     opencode_prompt_contract_system_prompt = (
@@ -527,7 +591,12 @@ def resolve_request_policy(
         else None
     )
     opencode_simple_chat_contract_active = False
-    if chat:
+    if not agent_middleware_active:
+        messages_for_generation, transcript_stats = srv._passthrough_agent_transcript(
+            request.messages
+        )
+        backend_chat_policy_active = False
+    elif chat:
         messages_for_generation, transcript_stats = srv._canonicalize_agent_transcript(
             request.messages,
             tools_active=agent_transcript_tools_active,
@@ -535,18 +604,26 @@ def resolve_request_policy(
             initial_client_system_prompt=opencode_prompt_contract_system_prompt,
             strip_tool_call_preamble_text=opencode_client,
         )
+        messages_for_generation, backend_chat_policy_active = (
+            srv._with_backend_chat_policy(
+                state,
+                messages_for_generation,
+            )
+        )
     else:
         messages_for_generation, transcript_stats = srv._canonicalize_agent_transcript(
             request.messages,
             tools_active=tools_active,
         )
-    messages_for_generation, backend_chat_policy_active = (
-        srv._with_backend_chat_policy(
-            state,
-            messages_for_generation,
+        messages_for_generation, backend_chat_policy_active = (
+            srv._with_backend_chat_policy(
+                state,
+                messages_for_generation,
+            )
         )
-    )
-    if chat:
+    # Preserve unsteered history for postcommit.
+    messages_before_turn_contract = list(messages_for_generation)
+    if chat and agent_middleware_active:
         if read_only_force_answer_contract_active:
             messages_for_generation = (
                 srv._with_mtplx_read_only_force_answer_contract(
@@ -566,7 +643,8 @@ def resolve_request_policy(
                 messages_for_generation
             )
     read_only_inspection_request = bool(
-        chat
+        agent_middleware_active
+        and chat
         and srv._is_read_only_inspection_request(
             srv._last_user_text(messages_for_generation)
         )
@@ -576,9 +654,9 @@ def resolve_request_policy(
     )
     raw_messages_for_postcommit = (
         list(request.messages)
-        if read_only_force_answer_contract_active
+        if not agent_middleware_active or read_only_force_answer_contract_active
         else (
-            list(messages_for_generation)
+            messages_before_turn_contract
             if (
                 no_tools_contract_active
                 or post_tool_answer_contract_active
@@ -589,13 +667,23 @@ def resolve_request_policy(
             else list(request.messages)
         )
     )
-    postcommit_tool_specs = (
-        tool_specs
-        if tools_active
-        else (requested_tool_specs if agent_transcript_tools_active else None)
+    model_tool_specs = (
+        requested_tool_specs
+        if not agent_middleware_active
+        else (tool_specs if tools_active else [])
     )
+    postcommit_tool_specs = (
+        requested_tool_specs if not agent_middleware_active else (
+            prompt_tool_specs if prompt_tool_specs else (requested_tool_specs if agent_transcript_tools_active else None)
+        )
+    )
+    # The short-request/system-mismatch detector is an MTPLX scheduling
+    # policy, not an OpenAI protocol field.  Transparent callers own their
+    # history, so it must not turn an ordinary short tool turn into a hidden
+    # background/cache-bypass request.
     background = bool(
         chat
+        and agent_middleware_active
         and srv.is_background_request(
             messages=messages_for_generation,
             max_tokens=srv._request_max_tokens(request),
@@ -610,17 +698,50 @@ def resolve_request_policy(
         or srv._foreground_model_work_pending(state)
     ):
         raise BackgroundBusyBypass()
+    request_effort_value, request_effort_source = srv._requested_reasoning_effort(
+        request
+    )
+    requested_effort: str | None = None
+    if reasoning_controls_allowed and request_effort_value is not None:
+        try:
+            requested_effort = srv._normalize_requested_reasoning_effort(
+                request_effort_value
+            )
+        except ValueError as exc:
+            raise srv.HTTPException(status_code=400, detail=str(exc)) from exc
+    requested_enable_thinking = srv._requested_enable_thinking(request)
+    if (
+        reasoning_controls_allowed
+        and requested_effort == "none"
+        and requested_enable_thinking is True
+    ):
+        raise srv.HTTPException(
+            status_code=400,
+            detail="enable_thinking=true conflicts with reasoning_effort='none'",
+        )
     thinking_enabled = srv._thinking_enabled_for_request(
         state,
         request,
-        allow_client_controls=client_controls_allowed,
+        allow_client_controls=reasoning_controls_allowed,
     )
+    if reasoning_controls_allowed and requested_effort == "none":
+        thinking_enabled = False
     reasoning_effort = srv._reasoning_effort_for_state(
         state,
         thinking_enabled=thinking_enabled,
-        request_effort=request.reasoning_effort,
-        allow_client_controls=client_controls_allowed,
+        request_effort=requested_effort,
+        allow_client_controls=reasoning_controls_allowed,
     )
+    reasoning_effort_template_supported: bool | None = None
+    if not agent_middleware_active and requested_effort is not None:
+        reasoning_effort_template_supported = (
+            srv._template_supports_qwen38_reasoning_effort(state)
+        )
+        srv._require_qwen38_reasoning_effort_template(
+            state,
+            requested_effort=requested_effort,
+            resolved_effort=reasoning_effort,
+        )
     if (
         read_only_force_answer_contract_active
         and srv._reasoning_parser_for_state(state) == "gemma4"
@@ -632,13 +753,25 @@ def resolve_request_policy(
         and thinking_enabled
         and srv._reasoning_parser_for_state(state) in {"qwen3", "step3p5"}
     )
-    tool_prompt_mode, tool_prompt_mode_resolution = srv._tool_prompt_mode_for_request(
-        state.args,
-        headers=headers,
-        metadata=metadata,
-        tools_active=tools_active,
-        backend=srv._backend_descriptor(state),
-    )
+    if agent_middleware_active:
+        tool_prompt_mode, tool_prompt_mode_resolution = (
+            srv._tool_prompt_mode_for_request(
+                state.args,
+                headers=headers,
+                metadata=metadata,
+                tools_active=bool(prompt_tool_specs),
+                backend=srv._backend_descriptor(state),
+            )
+        )
+    else:
+        tool_prompt_mode = srv._TOOL_PROMPT_MODE_NATIVE
+        tool_prompt_mode_resolution = {
+            "tool_prompt_mode_launch": srv._tool_prompt_mode_from_args(state.args),
+            "tool_prompt_mode_source": "agent_middleware:off",
+            "tool_prompt_mode_client": None,
+            "tool_prompt_mode_request_override": None,
+            "tool_prompt_mode_client_repaired": False,
+        }
     template_tool_prompt_mode = tool_prompt_mode
     if chat and read_only_force_answer_contract_active and tools_active:
         # Read-budget force-answer turns keep the SAME template mode as
@@ -654,7 +787,7 @@ def resolve_request_policy(
             "tool_prompt_mode_source": "read_only_force_answer_prefix_stable",
         }
     postcommit_tool_prompt_mode = tool_prompt_mode
-    if chat and postcommit_tool_specs and not tools_active:
+    if chat and agent_middleware_active and postcommit_tool_specs and not tools_active:
         postcommit_tool_prompt_mode, _ = srv._tool_prompt_mode_for_request(
             state.args,
             headers=headers,
@@ -668,9 +801,12 @@ def resolve_request_policy(
             opencode_client=opencode_client,
             requested_tool_specs=requested_tool_specs,
             tool_specs=tool_specs,
+            model_tool_specs=model_tool_specs,
             tools_active=tools_active,
+            prompt_tool_specs=prompt_tool_specs,
             agent_transcript_tools_active=agent_transcript_tools_active,
             postcommit_tool_specs=postcommit_tool_specs,
+            agent_middleware_active=agent_middleware_active,
             backend_chat_policy_active=backend_chat_policy_active,
             messages_for_generation=messages_for_generation,
             transcript_stats=transcript_stats,
@@ -678,6 +814,7 @@ def resolve_request_policy(
             tool_result_history_present=tool_result_history_present,
             thinking_enabled=thinking_enabled,
             reasoning_effort=reasoning_effort,
+            reasoning_controls_allowed=reasoning_controls_allowed,
             client_controls_allowed=client_controls_allowed,
             tool_prompt_mode=tool_prompt_mode,
             template_tool_prompt_mode=template_tool_prompt_mode,
@@ -717,28 +854,52 @@ def resolve_request_policy(
         server_reasoning_mode = (
             "on" if bool(getattr(state.args, "enable_thinking", True)) else "off"
         )
-    if not client_controls_allowed:
+    if not reasoning_controls_allowed:
         request_reasoning_mode = (
             "off" if not thinking_enabled else server_reasoning_mode
         )
-    elif request.enable_thinking is False:
+    elif not thinking_enabled:
         request_reasoning_mode = "off"
-    elif request.enable_thinking is True and server_reasoning_mode == "auto":
+    elif requested_enable_thinking is True:
         request_reasoning_mode = "on"
     else:
         request_reasoning_mode = server_reasoning_mode
     observability["request_reasoning_mode"] = request_reasoning_mode
     observability["request_enable_thinking"] = bool(thinking_enabled)
     observability["request_reasoning_effort"] = reasoning_effort
+    observability.update(
+        _responses_reasoning_observability(metadata, reasoning_effort)
+    )
     observability["request_enable_thinking_override"] = (
-        request.enable_thinking is not None and client_controls_allowed
+        requested_enable_thinking is not None and reasoning_controls_allowed
     )
     _control_ownership_observability(
         request,
         client_controls_allowed=client_controls_allowed,
+        thinking_controls_allowed=thinking_controls_allowed,
+        reasoning_controls_allowed=reasoning_controls_allowed,
         observability=observability,
     )
     observability["request_reasoning_parser"] = srv._reasoning_parser_for_state(state)
+    if not agent_middleware_active:
+        observability["agent_middleware"] = "off"
+        observability["reasoning_controls_allowed"] = bool(
+            reasoning_controls_allowed
+        )
+        observability["reasoning_control_owner"] = (
+            "client" if reasoning_controls_allowed else "server"
+        )
+        observability["request_reasoning_effort_requested"] = (
+            str(request_effort_value).strip().lower()
+            if request_effort_value is not None
+            else None
+        )
+        observability["request_reasoning_effort_resolved"] = reasoning_effort
+        observability["request_reasoning_effort_source"] = request_effort_source
+        if reasoning_effort_template_supported is not None:
+            observability["reasoning_effort_template_supported"] = bool(
+                reasoning_effort_template_supported
+            )
     observability["request_read_only_inspection_force_answer"] = bool(
         read_only_force_answer_contract_active
     )
@@ -843,9 +1004,12 @@ def resolve_request_policy(
         opencode_client=opencode_client,
         requested_tool_specs=requested_tool_specs,
         tool_specs=tool_specs,
+        model_tool_specs=model_tool_specs,
         tools_active=tools_active,
+        prompt_tool_specs=prompt_tool_specs,
         agent_transcript_tools_active=agent_transcript_tools_active,
         postcommit_tool_specs=postcommit_tool_specs,
+        agent_middleware_active=agent_middleware_active,
         read_only_force_answer_contract_active=read_only_force_answer_contract_active,
         no_tools_contract_active=no_tools_contract_active,
         post_tool_answer_contract_active=post_tool_answer_contract_active,
@@ -862,6 +1026,7 @@ def resolve_request_policy(
         background=background,
         thinking_enabled=thinking_enabled,
         reasoning_effort=reasoning_effort,
+        reasoning_controls_allowed=reasoning_controls_allowed,
         aime_visible_working=aime_visible_working,
         client_controls_allowed=client_controls_allowed,
         tool_prompt_mode=tool_prompt_mode,

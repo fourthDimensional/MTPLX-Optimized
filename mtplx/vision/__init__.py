@@ -9,6 +9,7 @@ from pathlib import Path
 from mtplx.vision.qwen3_vl_tower import (
     Qwen3VLVisionConfig,
     Qwen3VLVisionTower,
+    checkpoint_weight_map,
     resolve_vision_prefix,
 )
 
@@ -16,6 +17,7 @@ __all__ = [
     "Qwen3VLVisionConfig",
     "Qwen3VLVisionTower",
     "VisionSpec",
+    "checkpoint_weight_map",
     "load_vision_tower",
     "resolve_vision_prefix",
     "vision_spec_for_model_dir",
@@ -40,6 +42,15 @@ class VisionSpec:
     patch_size: int
     temporal_patch_size: int
     out_hidden_size: int
+    # M-RoPE contract from text_config.rope_parameters, for families whose
+    # attention ropes image tokens at (t, h, w) grid positions: qwen4_exp in
+    # its own attention, the dense qwen3_5 packs through mtplx.dense_mrope
+    # (which reads the section layout from the config at load). None when the
+    # family doesn't declare sections; serving then keeps plain sequential
+    # rope, which is what pre-mrope families expect.
+    model_type: str = ""
+    mrope_section: tuple[int, ...] | None = None
+    mrope_interleaved: bool = False
 
 
 def _read_json(path: Path) -> dict | None:
@@ -60,12 +71,21 @@ def vision_spec_for_model_dir(path: str | Path) -> VisionSpec | None:
     if not isinstance(vision_config, dict):
         return None
 
-    index = _read_json(model_dir / "model.safetensors.index.json")
-    if index is None:
+    weight_map = checkpoint_weight_map(model_dir)
+    if weight_map is None or resolve_vision_prefix(weight_map) is None:
         return None
-    weight_map = index.get("weight_map")
-    if not isinstance(weight_map, dict) or resolve_vision_prefix(weight_map) is None:
-        return None
+
+    text_config = config.get("text_config")
+    rope_parameters = (
+        text_config.get("rope_parameters") if isinstance(text_config, dict) else None
+    )
+    mrope_section: tuple[int, ...] | None = None
+    mrope_interleaved = False
+    if isinstance(rope_parameters, dict):
+        raw_section = rope_parameters.get("mrope_section")
+        if isinstance(raw_section, (list, tuple)) and raw_section:
+            mrope_section = tuple(int(x) for x in raw_section)
+        mrope_interleaved = bool(rope_parameters.get("mrope_interleaved", False))
 
     return VisionSpec(
         model_dir=str(model_dir),
@@ -81,6 +101,9 @@ def vision_spec_for_model_dir(path: str | Path) -> VisionSpec | None:
         patch_size=int(vision_config.get("patch_size", 16)),
         temporal_patch_size=int(vision_config.get("temporal_patch_size", 2)),
         out_hidden_size=int(vision_config.get("out_hidden_size", 5120)),
+        model_type=str(config.get("model_type", "")),
+        mrope_section=mrope_section,
+        mrope_interleaved=mrope_interleaved,
     )
 
 

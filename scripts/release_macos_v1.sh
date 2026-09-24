@@ -5,10 +5,12 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP_ROOT="$ROOT/apps/MTPLXApp"
 BUILD_SCRIPT="$APP_ROOT/script/build_and_run.sh"
 VERSION="${MTPLX_RELEASE_VERSION:-$(/usr/bin/awk -F'"' '/^version = / { print $2; exit }' "$ROOT/pyproject.toml")}"
-# Left empty, the build script derives it from VERSION; the appcast then reads
-# the number back off the built bundle so the feed cannot rank a release
-# differently from the app it ships.
-APP_BUILD="${MTPLX_RELEASE_BUILD:-}"
+# Sparkle ranks releases by CFBundleVersion alone. QA bundles take the numbers
+# after the one build_and_run.sh derives from VERSION (2.12.0's ran 2012001 to
+# 2012005), so the release names its own build: raise this with the version.
+# The appcast reads the number back off the built bundle, so the feed cannot
+# rank a release differently from the app it ships.
+APP_BUILD="${MTPLX_RELEASE_BUILD:-2012006}"
 RELEASE_TAG="${MTPLX_RELEASE_TAG:-v$VERSION}"
 GITHUB_REPO="${MTPLX_GITHUB_REPO:-youssofal/mtplx}"
 GITHUB_ASSET_BASE="${MTPLX_GITHUB_ASSET_BASE:-https://github.com/$GITHUB_REPO/releases/download/$RELEASE_TAG}"
@@ -27,6 +29,41 @@ APP_NOTARY_ZIP="$OUT_ROOT/MTPLX-$VERSION.app.zip"
 # Guard against accidentally shipping a pre-1.0 or malformed version.
 if [[ ! "$VERSION" =~ ^[1-9][0-9]*\.[0-9]+\.[0-9]+$ ]]; then
   echo "error: release version must be a stable x.y.z (>= 1.0.0), got $VERSION" >&2
+  exit 1
+fi
+
+# Sparkle ranks releases purely by CFBundleVersion, and the semantic
+# derivation in build_and_run.sh (major*1000000 + minor*1000 + patch) has
+# drifted below shipped reality: 2.9.1 shipped as 2009009 and 2.9.2 as
+# 2009010, so a derived 2.9.3 (2009003) would rank BELOW the shipped 2.9.2
+# and never be offered to updaters — while 2.9.2 could be offered "back" to
+# 2.9.3 users. Refuse, before any expensive gate runs, any build number
+# that does not strictly advance the local shipping record.
+LAST_SHIPPED_BUILD=0
+for _bn_manifest in "$HOME"/.mtplx/releases/*/site/releases/latest.json; do
+  [[ -f "$_bn_manifest" ]] || continue
+  _bn_val="$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("app_build",""))' "$_bn_manifest" 2>/dev/null || true)"
+  [[ "$_bn_val" =~ ^[0-9]+$ ]] || continue
+  if (( _bn_val > LAST_SHIPPED_BUILD )); then LAST_SHIPPED_BUILD="$_bn_val"; fi
+done
+if (( LAST_SHIPPED_BUILD > 0 && APP_BUILD <= LAST_SHIPPED_BUILD )); then
+  echo "error: build number $APP_BUILD does not advance the last shipped CFBundleVersion $LAST_SHIPPED_BUILD" >&2
+  echo "       Sparkle ranks by CFBundleVersion alone, so this release would never reach existing users." >&2
+  echo "       Export MTPLX_RELEASE_BUILD=$((LAST_SHIPPED_BUILD + 1)) and rerun." >&2
+  exit 1
+fi
+
+RELEASE_NOTES_MD="$ROOT/docs/releases/v$VERSION.md"
+if [[ ! -f "$RELEASE_NOTES_MD" ]]; then
+  echo "error: release notes source missing: $RELEASE_NOTES_MD" >&2
+  echo "write the user-facing notes for v$VERSION before releasing" >&2
+  exit 1
+fi
+# The notes become the Sparkle and site pages and README.md the PyPI page, so
+# draft wording in either would ship verbatim.
+if /usr/bin/grep -n -E 'Release draft|Pending|Unreleased|release candidate|provisional' \
+  "$RELEASE_NOTES_MD" "$ROOT/README.md" >&2; then
+  echo "error: draft wording above in the release notes or README.md; finish them before releasing" >&2
   exit 1
 fi
 
@@ -84,25 +121,50 @@ fi
 #   MTPLX_RELEASE_PILLAR_QA_URL=http://127.0.0.1:<port> \
 #   MTPLX_RELEASE_PILLAR_QA_FAN_RPM=<measured rpm>
 # Skipping prints the same not-release-ready warning as the test gates.
+# An executable lifecycle runner can own start/stop and return freshly
+# verified RPM from `start URL` and `fan-rpm`. Start happens after Swift:
+# lifecycle tests may restore the host's real fans to automatic control.
+PILLAR_QA_RUNNER="${MTPLX_RELEASE_PILLAR_QA_RUNNER:-}"
 if [[ "${MTPLX_RELEASE_SKIP_PILLAR_QA:-0}" != "1" ]]; then
   if [[ -z "${MTPLX_RELEASE_PILLAR_QA_URL:-}" ]]; then
     echo "error: pillar gate needs MTPLX_RELEASE_PILLAR_QA_URL (a serving daemon under verified max fans)" >&2
     echo "       or MTPLX_RELEASE_SKIP_PILLAR_QA=1 to skip (artifact then not release-ready)" >&2
     exit 1
   fi
+  PILLAR_FAN_RPM="${MTPLX_RELEASE_PILLAR_QA_FAN_RPM:-0}"
+  if [[ -n "$PILLAR_QA_RUNNER" ]]; then
+    if [[ ! -x "$PILLAR_QA_RUNNER" ]]; then
+      echo "error: pillar lifecycle runner is not executable: $PILLAR_QA_RUNNER" >&2
+      exit 1
+    fi
+    trap '"$PILLAR_QA_RUNNER" stop' EXIT
+    PILLAR_FAN_RPM="$("$PILLAR_QA_RUNNER" start "$MTPLX_RELEASE_PILLAR_QA_URL")"
+  fi
   echo "Release gate: pillar QA (vision cache / memory ceiling / decode decay)"
   "$ROOT/.venv/bin/python" "$ROOT/scripts/pillar_gate_qa.py" \
     --base-url "$MTPLX_RELEASE_PILLAR_QA_URL" \
-    --fan-rpm-verified "${MTPLX_RELEASE_PILLAR_QA_FAN_RPM:-0}"
+    --fan-rpm-verified "$PILLAR_FAN_RPM"
+  # Agent-session gate: the coding-agent turn loop every harness drives
+  # (OpenCode, Pi, Hermes, Claude Code, Cline), judged from the engine's own
+  # receipts -- warm-turn dead time, bank hits after tool calls, hidden
+  # postcommit waits, O(1) generation-final snapshots, decode floor, stream
+  # errors. 2026-09-03: three engine defects cost a 14-minute OpenCode task
+  # 146 s and read as "decode 21 tok/s"; none was visible to a unit test or a
+  # single-request benchmark, all fail this gate.
+  echo "Release gate: agent-session QA (warm-turn dead time / bank hits / postcommit / decode floor)"
+  if [[ -n "$PILLAR_QA_RUNNER" ]]; then
+    PILLAR_FAN_RPM="$("$PILLAR_QA_RUNNER" fan-rpm)"
+  fi
+  "$ROOT/.venv/bin/python" "$ROOT/scripts/agent_session_gate.py" \
+    --base-url "$MTPLX_RELEASE_PILLAR_QA_URL" \
+    --context-tokens "${MTPLX_RELEASE_AGENT_GATE_CONTEXT_TOKENS:-40000}" \
+    --fan-rpm-verified "$PILLAR_FAN_RPM"
+  if [[ -n "$PILLAR_QA_RUNNER" ]]; then
+    "$PILLAR_QA_RUNNER" stop
+    trap - EXIT
+  fi
 else
   echo "warning: MTPLX_RELEASE_SKIP_PILLAR_QA=1 — pillar gate skipped; this artifact is not release-ready" >&2
-fi
-
-RELEASE_NOTES_MD="$ROOT/docs/releases/v$VERSION.md"
-if [[ ! -f "$RELEASE_NOTES_MD" ]]; then
-  echo "error: release notes source missing: $RELEASE_NOTES_MD" >&2
-  echo "write the user-facing notes for v$VERSION before releasing" >&2
-  exit 1
 fi
 
 submit_notarization() {
@@ -167,6 +229,59 @@ if [[ ! -x "$PBS_EXTRACT_DIR/bin/python3" ]]; then
   exit 1
 fi
 
+# Build the optional sparse-prefill consumer for the exact bundled Python.
+# Keep the pure wheel beside it: pip/app tag selection declines this binary
+# on older macOS or a different Python ABI rather than breaking installation.
+NATIVE_BUILD_VENV="$OUT_ROOT/native-build-venv"
+NATIVE_DIST="$OUT_ROOT/native-wheels"
+NATIVE_MLX_DIST="$OUT_ROOT/native-mlx-macos15-wheels"
+"$PBS_EXTRACT_DIR/bin/python3" -m venv "$NATIVE_BUILD_VENV"
+"$NATIVE_BUILD_VENV/bin/python" -m pip install \
+  build wheel setuptools 'cmake>=3.27' 'nanobind==2.15.0'
+# pip otherwise selects the host's macOS 26 MLX library, whose minimum OS
+# is 26.2, even though the native wheel below is tagged for macOS 15.
+"$NATIVE_BUILD_VENV/bin/python" -m pip download \
+  --only-binary=:all: --platform macosx_15_0_arm64 \
+  --dest "$NATIVE_MLX_DIST" 'mlx==0.32.2'
+# Explicit wheel paths also replace a newer-platform copy in a reused venv.
+"$NATIVE_BUILD_VENV/bin/python" -m pip install --force-reinstall --no-deps \
+  "$NATIVE_MLX_DIST"/*-macosx_15_0_arm64.whl
+MACOSX_DEPLOYMENT_TARGET=15.0 "$NATIVE_BUILD_VENV/bin/python" -m build \
+  --wheel --no-isolation "$ROOT/native_extensions/qsa_kernels" --outdir "$NATIVE_DIST"
+NATIVE_WHEELS=("$NATIVE_DIST"/mtplx_qsa_kernels-*.whl)
+if [[ "${#NATIVE_WHEELS[@]}" != "1" || ! -f "${NATIVE_WHEELS[0]}" ]]; then
+  echo "error: expected exactly one native QSA wheel" >&2
+  exit 1
+fi
+NATIVE_RUNTIME_WHEEL="$("$NATIVE_BUILD_VENV/bin/python" \
+  "$ROOT/scripts/bundle_native_runtime_wheel.py" "$PYTHON_WHEEL" \
+  "${NATIVE_WHEELS[0]}" --out "$PYTHON_DIST" --codesign-identity "$CODESIGN_IDENTITY")"
+"$PYTOOLS_VENV/bin/python" -m twine check "$NATIVE_RUNTIME_WHEEL"
+
+# Notarization gate: every Mach-O inside the runtime wheel must carry the
+# Developer ID and a secure timestamp. The app's signing pass cannot reach
+# into the wheel, and the notary service rejected 2.11.2's first submission
+# on exactly these two files; catch it here, not after a 20-minute upload.
+NATIVE_CHECK_DIR="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/mtplx-native-wheel-check.XXXXXX")"
+/usr/bin/unzip -q -o "$NATIVE_RUNTIME_WHEEL" -d "$NATIVE_CHECK_DIR"
+NATIVE_SIGNED=0
+while IFS= read -r member; do
+  [[ -n "$member" ]] || continue
+  /usr/bin/codesign --verify --strict "$member"
+  details="$(/usr/bin/codesign -dvvv "$member" 2>&1)"
+  if ! /usr/bin/grep -q 'Authority=Developer ID Application' <<<"$details" \
+     || ! /usr/bin/grep -q '^Timestamp=' <<<"$details"; then
+    echo "error: ${member#"$NATIVE_CHECK_DIR"/} is not Developer ID signed with a secure timestamp; notarization would reject it" >&2
+    exit 1
+  fi
+  NATIVE_SIGNED=$((NATIVE_SIGNED + 1))
+done < <(/usr/bin/find "$NATIVE_CHECK_DIR" \( -name '*.so' -o -name '*.dylib' \) -type f)
+if [[ "$NATIVE_SIGNED" -lt 2 ]]; then
+  echo "error: expected the QSA extension and its kernel library inside $NATIVE_RUNTIME_WHEEL, found $NATIVE_SIGNED signed Mach-O files" >&2
+  exit 1
+fi
+echo "Native runtime wheel: $NATIVE_SIGNED Mach-O members Developer ID signed with secure timestamps"
+
 echo "Building signed MTPLX.app"
 MTPLX_APP_PUBLIC_RELEASE=1 \
 MTPLX_APP_VERSION="$VERSION" \
@@ -174,6 +289,7 @@ MTPLX_APP_BUILD="$APP_BUILD" \
 MTPLX_APP_BUNDLE_DIR="$APP_BUNDLE" \
 MTPLX_APP_EMBED_LOCAL_RUNTIME_WRAPPER=0 \
 MTPLX_RUNTIME_WHEEL="$PYTHON_WHEEL" \
+MTPLX_NATIVE_RUNTIME_WHEEL="$NATIVE_RUNTIME_WHEEL" \
 MTPLX_REQUIRE_RUNTIME_WHEEL_RESOURCE=1 \
 MTPLX_BUNDLED_PYTHON_DIR="$PBS_EXTRACT_DIR" \
 MTPLX_REQUIRE_BUNDLED_PYTHON_RESOURCE=1 \
@@ -261,29 +377,11 @@ DMG_URL="$GITHUB_ASSET_BASE/$(basename "$DMG")"
 
 # Sparkle's "what's new" dialog and the hosted notes page render the real
 # release notes authored in docs/releases/v$VERSION.md (gated above).
-"$PYTOOLS_VENV/bin/python" - "$RELEASE_NOTES_MD" "$NOTES_OUT/v$VERSION.html" "$VERSION" <<'PY'
-import pathlib
-import sys
-
-import markdown
-
-source, destination, version = sys.argv[1], sys.argv[2], sys.argv[3]
-body = markdown.markdown(
-    pathlib.Path(source).read_text(encoding="utf-8"),
-    extensions=["extra"],
-)
-html = (
-    "<!doctype html>\n"
-    '<meta charset="utf-8">\n'
-    f"<title>MTPLX {version}</title>\n"
-    '<style>body{font-family:-apple-system,system-ui,sans-serif;'
-    "max-width:42em;margin:2em auto;padding:0 1em;line-height:1.55}"
-    "h1,h2{line-height:1.2}code{background:#f2f2f4;padding:0 .25em;"
-    "border-radius:4px}</style>\n"
-    f"{body}\n"
-)
-pathlib.Path(destination).write_text(html, encoding="utf-8")
-PY
+# scripts/render_release_notes.py owns the page template — light AND dark
+# mode readable (#367) — and the rehearsal kit renders through the same
+# file, so do not inline a template copy here again.
+"$PYTOOLS_VENV/bin/python" "$ROOT/scripts/render_release_notes.py" \
+  "$RELEASE_NOTES_MD" "$NOTES_OUT/v$VERSION.html" "$VERSION"
 
 python3 - "$RELEASES_OUT/latest.json" "$VERSION" "$APP_BUILD" "$DMG_URL" "$DMG_SHA256" "$DMG_SIZE" "$RELEASE_NOTES_URL" <<'PY'
 import datetime

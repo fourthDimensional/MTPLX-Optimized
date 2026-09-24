@@ -4,9 +4,18 @@ import XCTest
 final class OnboardingFeatureStateTests: XCTestCase {
     // MARK: goNext / goBack walk the canonical case order
 
+    func testLanguageIsTheFirstStep() {
+        XCTAssertEqual(OnboardingStep.allCases.first, .language)
+        XCTAssertEqual(OnboardingStep.language.index, 0)
+        XCTAssertEqual(OnboardingStep.welcome.index, 1)
+        XCTAssertEqual(OnboardingStep.tune.index, OnboardingStep.allCases.count - 1)
+        XCTAssertTrue(OnboardingFeatureState(step: .language).canAdvance)
+    }
+
     func testGoNextWalksThroughEveryStep() {
         var s = OnboardingFeatureState()
-        XCTAssertEqual(s.step, .welcome)
+        XCTAssertEqual(s.step, .language)
+        s.goNext(); XCTAssertEqual(s.step, .welcome)
         s.goNext(); XCTAssertEqual(s.step, .hardwareScan)
         s.goNext(); XCTAssertEqual(s.step, .modelPick)
         s.goNext(); XCTAssertEqual(s.step, .runtimeSetup)
@@ -20,14 +29,15 @@ final class OnboardingFeatureStateTests: XCTestCase {
         XCTAssertEqual(s.step, .tune)
     }
 
-    func testGoBackWalksReverseAndStopsAtWelcome() {
+    func testGoBackWalksReverseAndStopsAtLanguage() {
         var s = OnboardingFeatureState(step: .tune)
         s.goBack(); XCTAssertEqual(s.step, .download)
         s.goBack(); XCTAssertEqual(s.step, .runtimeSetup)
         s.goBack(); XCTAssertEqual(s.step, .modelPick)
         s.goBack(); XCTAssertEqual(s.step, .hardwareScan)
         s.goBack(); XCTAssertEqual(s.step, .welcome)
-        s.goBack(); XCTAssertEqual(s.step, .welcome) // clamped
+        s.goBack(); XCTAssertEqual(s.step, .language)
+        s.goBack(); XCTAssertEqual(s.step, .language) // clamped
     }
 
     func testRuntimeSetupSitsBetweenModelPickAndDownload() {
@@ -91,6 +101,10 @@ final class OnboardingFeatureStateTests: XCTestCase {
         XCTAssertTrue(s.canAdvance, "Curated Quality always resolves to a catalog entry")
         s.pick = .curatedGemmaSpeed
         XCTAssertTrue(s.canAdvance, "Curated Gemma Speed always resolves to a catalog entry")
+        s.pick = .curatedFlashNextBareSpeed
+        XCTAssertTrue(s.canAdvance, "Curated Flash-Next Bare Speed always resolves to a catalog entry")
+        s.pick = .curatedFlashNextOptimizedSpeed
+        XCTAssertTrue(s.canAdvance, "Curated Flash-Next Optimized Speed always resolves to a catalog entry")
         s.pick = .curatedStepFlash
         XCTAssertFalse(s.canAdvance, "StepFun is held out of the release catalog")
     }
@@ -107,15 +121,16 @@ final class OnboardingFeatureStateTests: XCTestCase {
         XCTAssertTrue(s.canAdvance, "Ready probe allows advance")
     }
 
-    func testModelPickNoMTPRequiresExplicitAcknowledgement() {
-        var s = OnboardingFeatureState(
+    func testModelPickNoMTPAdvancesWithoutAcknowledgement() {
+        // Founder directive 2026-08-26: MTP unavailable is informational,
+        // never a gate. The engine serves MTP-less checkpoints AR, so the
+        // wizard advances the same way the CLI runs them.
+        let s = OnboardingFeatureState(
             step: .modelPick,
             pick: .other(hfRepo: "Foo/Bar"),
-            otherProbe: OtherModelProbe(verdict: .noMTP, hfRepo: "Foo/Bar", message: "No MTP")
+            otherProbe: OtherModelProbe(verdict: .noMTP, hfRepo: "Foo/Bar", message: "MTP unavailable")
         )
-        XCTAssertFalse(s.canAdvance, "noMTP blocks until acknowledged")
-        s.hasAcknowledgedOtherWarning = true
-        XCTAssertTrue(s.canAdvance, "Acknowledged noMTP allows advance")
+        XCTAssertTrue(s.canAdvance, "noMTP is informational and advances")
     }
 
     func testModelPickLocalRequiresReadyProbe() {
@@ -138,36 +153,29 @@ final class OnboardingFeatureStateTests: XCTestCase {
         XCTAssertTrue(s.canAdvance, "Complete MTPLX local folders allow advance")
     }
 
-    // MARK: select(_:) wipes stale probe + acknowledgement
+    // MARK: select(_:) wipes stale probes
 
-    func testSelectChoiceClearsProbeAndAcknowledgement() {
+    func testSelectChoiceClearsProbes() {
         var s = OnboardingFeatureState(
             step: .modelPick,
             pick: .other(hfRepo: "Foo/Bar"),
             otherProbe: OtherModelProbe(verdict: .ready, hfRepo: "Foo/Bar", message: "OK"),
-            localProbe: LocalModelProbe(verdict: .ready, path: "/models/qwen", message: "Ready"),
-            hasAcknowledgedOtherWarning: true
+            localProbe: LocalModelProbe(verdict: .ready, path: "/models/qwen", message: "Ready")
         )
         s.select(.curatedSpeed)
         XCTAssertEqual(s.pick, .curatedSpeed)
         XCTAssertNil(s.otherProbe)
         XCTAssertNil(s.localProbe)
-        XCTAssertFalse(s.hasAcknowledgedOtherWarning)
     }
 
-    func testRecordProbeWipesAcknowledgement() {
+    func testRecordProbeReplacesPrevious() {
         var s = OnboardingFeatureState(
             step: .modelPick,
             pick: .other(hfRepo: "Foo/Bar"),
-            otherProbe: OtherModelProbe(verdict: .noMTP, hfRepo: "Foo/Bar", message: "No MTP"),
-            hasAcknowledgedOtherWarning: true
+            otherProbe: OtherModelProbe(verdict: .noMTP, hfRepo: "Foo/Bar", message: "MTP unavailable")
         )
         s.record(OtherModelProbe(verdict: .ready, hfRepo: "Foo/Bar", message: "OK"))
         XCTAssertEqual(s.otherProbe?.verdict, .ready)
-        XCTAssertFalse(
-            s.hasAcknowledgedOtherWarning,
-            "A new probe must force a fresh acknowledgement"
-        )
     }
 
     // MARK: resolvedModel applies M1/M2 FP16 routing
@@ -342,6 +350,46 @@ final class OnboardingFeatureStateTests: XCTestCase {
         ])
     }
 
+    func testResolvedModelForFlashNextBareSpeedPassesThroughOnModernApple() {
+        let m5 = DetectedHardware(
+            chipName: "Apple M5 Max",
+            appleSiliconGeneration: "m5",
+            unifiedMemoryBytes: 128 * 1_073_741_824
+        )
+        let s = OnboardingFeatureState(hardware: m5, pick: .curatedFlashNextBareSpeed)
+        XCTAssertEqual(s.resolvedModel?.id, "flash-next-bare-speed")
+        XCTAssertEqual(s.resolvedRepoID, "Youssofal/Qwen3.8-Flash-Next-MTPLX-Bare-Speed")
+        XCTAssertEqual(s.resolvedModelFamily, "qwen4_exp")
+        XCTAssertFalse(s.supportsTune)
+    }
+
+    func testResolvedModelForFlashNextOptimizedSpeedPassesThroughOnModernApple() {
+        let m5 = DetectedHardware(
+            chipName: "Apple M5 Max",
+            appleSiliconGeneration: "m5",
+            unifiedMemoryBytes: 128 * 1_073_741_824
+        )
+        let s = OnboardingFeatureState(hardware: m5, pick: .curatedFlashNextOptimizedSpeed)
+        XCTAssertEqual(s.resolvedModel?.id, "flash-next-optimized-speed")
+        XCTAssertEqual(s.resolvedRepoID, "Youssofal/Qwen3.8-Flash-Next-MTPLX-Optimized-Speed")
+        XCTAssertEqual(s.resolvedModelFamily, "qwen4_exp")
+        XCTAssertFalse(s.supportsTune)
+    }
+
+    func testResolvedModelForFlashNextHasNoFP16SwapOnLegacyApple() {
+        // Flash-Next has no FP16 sibling (modern-tier-only packs), so the
+        // legacy swap the 3.8 trio gets must NOT fire here.
+        let m1 = DetectedHardware(
+            chipName: "Apple M1 Max",
+            appleSiliconGeneration: "m1",
+            unifiedMemoryBytes: 64 * 1_073_741_824
+        )
+        let bare = OnboardingFeatureState(hardware: m1, pick: .curatedFlashNextBareSpeed)
+        let optimized = OnboardingFeatureState(hardware: m1, pick: .curatedFlashNextOptimizedSpeed)
+        XCTAssertEqual(bare.resolvedModel?.id, "flash-next-bare-speed")
+        XCTAssertEqual(optimized.resolvedModel?.id, "flash-next-optimized-speed")
+    }
+
     func testResolvedModelForStepIsHeldOutOfReleaseCatalog() {
         let m5 = DetectedHardware(
             chipName: "Apple M5 Max",
@@ -359,6 +407,21 @@ final class OnboardingFeatureStateTests: XCTestCase {
         XCTAssertFalse(s.supportsTune)
         XCTAssertEqual(s.tuneCandidates, [])
         XCTAssertFalse(s.canAdvance)
+    }
+
+    @MainActor
+    func testPausedDownloadBytesCountTowardTheDiskGate() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mtplx-paused-download-\(UUID().uuidString)", isDirectory: true)
+        let folder = root.appendingPathComponent("Example--Paused", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Data(count: 4096).write(to: folder.appendingPathComponent("model-00001-of-00002.safetensors"))
+        try Data(count: 1024).write(to: folder.appendingPathComponent("model-00002-of-00002.safetensors.incomplete"))
+
+        let orchestrator = OnboardingOrchestrator(modelLibrary: ModelLibrary(primaryDirectory: root.path))
+        XCTAssertEqual(orchestrator.downloadedBytes(forRepo: "Example/Paused"), 5120)
+        XCTAssertEqual(orchestrator.downloadedBytes(forRepo: "Example/NotStarted"), 0)
     }
 
     @MainActor

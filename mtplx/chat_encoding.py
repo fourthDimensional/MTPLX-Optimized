@@ -230,6 +230,14 @@ def encode_gemma4_messages(
         if role == "assistant":
             role = "model"
             content = strip_gemma4_thinking_text(content)
+            reasoning = _content_to_text(
+                item.get("reasoning_content") or item.get("reasoning")
+            )
+            if enable_thinking and reasoning:
+                content = (
+                    f"{GEMMA4_THINK_OPEN}{GEMMA4_THOUGHT_PREFIX}"
+                    f"{reasoning}{GEMMA4_THINK_CLOSE}{content}"
+                )
             tool_call_text = _gemma4_tool_calls_text(item.get("tool_calls"))
             if tool_call_text:
                 content = (
@@ -296,6 +304,8 @@ def encode_chat_messages(
             fallback_kwargs["tools"] = tools
         return list(tokenizer.apply_chat_template(messages, **fallback_kwargs))
     except Exception:
+        if getattr(tokenizer, "chat_template", None):
+            raise
         prompt = "\n".join(
             f"{item.get('role', 'user')}: {item.get('content', '')}" for item in messages
         )

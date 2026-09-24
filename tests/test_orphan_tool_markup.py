@@ -72,6 +72,52 @@ def test_stream_splitter_suppresses_orphan_spans():
     assert splitter.suppressed_tool_markup_chars > 0
 
 
+def test_stream_splitter_consumes_the_whole_tool_call_block():
+    # 2026-09-22 image-cell transcript on Flash-Next: two hallucinated calls
+    # in a no-tools request streamed as "...module.</tool_call></tool_call>"
+    # because the span closed at the body's `</function>` and the block's own
+    # `</tool_call>` then streamed as visible text.
+    splitter = srv._ThinkingContentStreamSplitter(
+        thinking_enabled=False,
+        suppress_orphan_tool_markup=True,
+    )
+    chunks = []
+    for piece in (
+        "I'll explore the project structure first.\n\n",
+        "<tool_call>\n<function=list_files>\n<parameter=path>.</parameter>\n</function>\n</tool_call>\n",
+        "<tool_call>\n<function=glob_files>\n<parameter=pattern>*.py</parameter>\n</function>\n</tool_call>",
+    ):
+        chunks.extend(splitter.feed(piece))
+    chunks.extend(splitter.finish())
+    content = "".join(text for field, text in chunks if field == "content")
+    assert "</tool_call>" not in content
+    assert "</function>" not in content
+    assert "list_files" not in content and "glob_files" not in content
+    assert "I'll explore the project structure first." in content
+    # The streamed text converges on the non-stream stripper's result.
+    non_stream, stripped = srv._strip_orphan_tool_markup(
+        "I'll explore the project structure first.\n\n"
+        "<tool_call>\n<function=list_files>\n<parameter=path>.</parameter>\n</function>\n</tool_call>\n"
+        "<tool_call>\n<function=glob_files>\n<parameter=pattern>*.py</parameter>\n</function>\n</tool_call>"
+    )
+    assert stripped == 2
+    assert content.strip() == non_stream.strip()
+
+
+def test_stream_splitter_bare_function_span_still_closes_on_function():
+    splitter = srv._ThinkingContentStreamSplitter(
+        thinking_enabled=False,
+        suppress_orphan_tool_markup=True,
+    )
+    chunks = []
+    for piece in ("Look: ", "<function=search>\n<parameter=q>x</parameter>\n</function>", " done."):
+        chunks.extend(splitter.feed(piece))
+    chunks.extend(splitter.finish())
+    content = "".join(text for field, text in chunks if field == "content")
+    assert "<function" not in content and "</function>" not in content
+    assert "Look:" in content and "done." in content
+
+
 def test_stream_splitter_passthrough_when_tools_active():
     splitter = srv._ThinkingContentStreamSplitter(
         thinking_enabled=False,
@@ -83,3 +129,100 @@ def test_stream_splitter_passthrough_when_tools_active():
     chunks.extend(splitter.finish())
     content = "".join(text for field, text in chunks if field == "content")
     assert "<tool_call>x</tool_call>" in content
+
+
+# --- Issue #349: suppressed tool calls must leave a visible, truthful ---
+# --- notice instead of silence ("tool calls going out into the void") ---
+
+
+def test_tool_markup_call_names_extracts_from_spans():
+    text = (
+        "Let me look.\n"
+        '<tool_call>\n{"name": "terminal", "arguments": {"command": "ls ~/Dev"}}\n'
+        "</tool_call>\n"
+        "<function=search_files>\n<parameter=query>readme</parameter>\n</function>\n"
+    )
+    assert srv._tool_markup_call_names(text) == ["terminal", "search_files"]
+
+
+def test_tool_markup_call_names_ignores_prose_json():
+    # A JSON object the model wrote as prose (outside any tool-call span)
+    # must not be misread as a call.
+    text = 'Here is the config: {"name": "value"} — nothing else.'
+    assert srv._tool_markup_call_names(text) == []
+
+
+def test_unknown_tool_name_from_reason():
+    assert srv._unknown_tool_name_from_reason("unknown tool 'terminal'") == "terminal"
+    assert srv._unknown_tool_name_from_reason("something else entirely") == ""
+
+
+def test_no_tools_notice_is_truthful_and_names_tools():
+    notice = srv._no_tools_unexecuted_call_notice(["terminal", "read_file"])
+    assert notice
+    assert '"terminal"' in notice
+    assert '"read_file"' in notice
+    assert "nothing was executed" in notice
+    # Nameless turns still get a non-empty truthful notice.
+    assert "nothing was executed" in srv._no_tools_unexecuted_call_notice([])
+
+
+def test_unknown_tool_notice_names_available_tools():
+    notice = srv._unknown_tool_unexecuted_call_notice(
+        "terminal", ["web_search", "fetch_url"]
+    )
+    assert notice
+    assert '"terminal"' in notice
+    assert "web_search, fetch_url" in notice
+    assert "was not executed" in notice
+    # No declared tools at all still yields a truthful, non-empty notice.
+    assert "available: none" in srv._unknown_tool_unexecuted_call_notice("x", [])
+
+
+def test_append_notice_is_idempotent_and_never_empty():
+    notice = srv._no_tools_unexecuted_call_notice(["ls"])
+    once = srv._append_unexecuted_tool_notice("prose", notice)
+    assert once.startswith("prose")
+    assert notice in once
+    # Idempotent: appending again does not duplicate the notice.
+    assert srv._append_unexecuted_tool_notice(once, notice) == once
+    # A turn with no salvageable prose becomes the notice, never "".
+    assert srv._append_unexecuted_tool_notice("", notice) == notice
+    assert srv._append_unexecuted_tool_notice("   \n", notice) == notice
+
+
+def test_no_tools_turn_that_is_only_a_tool_call_yields_visible_truth():
+    # The exact #349 shape: the whole turn is one dead tool call. Before
+    # the fix, the strip returned "" and the user + model both got a blank.
+    # This mirrors the non-stream call-site sequence (strip, then notice).
+    text = '<tool_call>\n{"name": "ls", "arguments": {"path": "~/Dev"}}\n</tool_call>'
+    names = srv._tool_markup_call_names(text)
+    cleaned, count = srv._strip_orphan_tool_markup(text)
+    assert count == 1
+    assert cleaned == ""
+    final = srv._append_unexecuted_tool_notice(
+        cleaned, srv._no_tools_unexecuted_call_notice(names)
+    )
+    assert final
+    assert '"ls"' in final
+    assert "nothing was executed" in final
+
+
+def test_stream_suppression_counter_drives_the_notice_gate():
+    # The streaming call site fires the notice when the splitter suppressed
+    # markup on a no-tools turn; pin the counter + composed notice together.
+    splitter = srv._ThinkingContentStreamSplitter(
+        thinking_enabled=False,
+        suppress_orphan_tool_markup=True,
+    )
+    raw = '<tool_call>\n{"name": "search_files", "arguments": {"query": "x"}}\n</tool_call>'
+    chunks = []
+    for piece in (raw[: len(raw) // 2], raw[len(raw) // 2 :]):
+        chunks.extend(splitter.feed(piece))
+    chunks.extend(splitter.finish())
+    content = "".join(text for field, text in chunks if field == "content")
+    assert "search_files" not in content
+    assert splitter.suppressed_tool_markup_chars > 0
+    notice = srv._no_tools_unexecuted_call_notice(srv._tool_markup_call_names(raw))
+    assert '"search_files"' in notice
+    assert "nothing was executed" in notice

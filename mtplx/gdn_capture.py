@@ -2568,6 +2568,17 @@ def _stock_gated_delta_capture(
     return mx.concatenate(outs, axis=1), mx.stack(states, axis=1)
 
 
+gdn_capture_fallback_counts: dict[str, int] = {}
+
+
+def _count_gdn_capture_fallback(reason: str) -> None:
+    """Per-backend counter for capture-lane degradations (Route Tape reads the
+    delta per round). Follows the nax_qlinear_fallback_counts pattern: these
+    paths must be loud in telemetry even though they stay silent in control
+    flow — a capture that degrades to stock still returns correct output."""
+    gdn_capture_fallback_counts[reason] = gdn_capture_fallback_counts.get(reason, 0) + 1
+
+
 def gdn_forward_with_capture(
     gdn: Any,
     inputs: mx.array,
@@ -2577,6 +2588,7 @@ def gdn_forward_with_capture(
     capture_backend: str | None = None,
 ):
     if getattr(gdn, "sharding_group", None) is not None:
+        _count_gdn_capture_fallback("sharding_group")
         return gdn(inputs, mask=mask, cache=cache), None
 
     from mlx_lm.models.gated_delta import compute_g
@@ -2596,6 +2608,8 @@ def gdn_forward_with_capture(
     conv_capture = None
     if _env_enabled("MTPLX_LINEAR_CONV1D_CAPTURE"):
         conv_capture = _linear_conv1d_capture(qkv, conv_state, gdn.conv1d.weight)
+        if conv_capture is None:
+            _count_gdn_capture_fallback("conv1d_capture_stock")
     if conv_capture is None:
         conv_capture = _stock_conv1d_capture(qkv, conv_state, gdn)
     conv_out, conv_states = conv_capture
@@ -2618,6 +2632,7 @@ def gdn_forward_with_capture(
             gdn,
         )
         if delta_result is None:
+            _count_gdn_capture_fallback(f"delta_none:{backend}")
             return gdn(inputs, mask=mask, cache=cache), None
         out, states = delta_result
     elif backend == "linear_gdn_from_conv_tape":
@@ -2631,6 +2646,7 @@ def gdn_forward_with_capture(
             gdn,
         )
         if delta_result is None:
+            _count_gdn_capture_fallback(f"delta_none:{backend}")
             return gdn(inputs, mask=mask, cache=cache), None
         out, final_state, tape = delta_result
         states = final_state[:, None, :, :, :]
@@ -2650,6 +2666,7 @@ def gdn_forward_with_capture(
             capture_start=capture_start,
         )
         if delta_result is None:
+            _count_gdn_capture_fallback(f"delta_none:{backend}")
             return gdn(inputs, mask=mask, cache=cache), None
         out, states = delta_result
     elif backend in {"linear_gdn", "linear_gdn_from_conv"}:
@@ -2681,6 +2698,7 @@ def gdn_forward_with_capture(
             k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
             delta_result = _linear_gated_delta_capture(q, k, v, g, beta, state)
         if delta_result is None:
+            _count_gdn_capture_fallback(f"delta_none:{backend}")
             return gdn(inputs, mask=mask, cache=cache), None
         out, states = delta_result
     elif backend == "linear_gdn_final":
@@ -2699,6 +2717,7 @@ def gdn_forward_with_capture(
         g = compute_g(gdn.A_log, a, gdn.dt_bias)
         delta_result = _linear_gated_delta_final(q, k, v, g, beta, state)
         if delta_result is None:
+            _count_gdn_capture_fallback(f"delta_none:{backend}")
             return gdn(inputs, mask=mask, cache=cache), None
         out, final_state = delta_result
         states = final_state[:, None, :, :, :]
@@ -2956,6 +2975,26 @@ def forward_with_a3b_gdn_postconv_capture_bound_projections(
     return logits, hidden, captures
 
 
+def _fused_post_norm_tg_override() -> int | None:
+    """Threadgroup override for the fused post-norm residual lane.
+
+    None (the default) lets fused_add_rmsnorm mirror mx.fast.rms_norm's own
+    exact-fit/looped dispatch, which is bitwise-identical to the unfused
+    reference at every probed axis/row/dtype. A fixed value forces the looped
+    kernel at that lane count and changes the fp32 partial-sum partition — the
+    shipped 512 produced one-ULP fp16 flips at axes 3072/5120 from 64 rows up
+    (#319). Env knob exists for A/B archaeology only.
+    """
+    raw = os.environ.get("MTPLX_FUSE_POST_NORM_RESIDUAL_TG", "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
 def forward_with_gdn_capture(
     model: Any,
     inputs: mx.array,
@@ -3028,12 +3067,22 @@ def forward_with_gdn_capture(
                 h = hidden_states + r
                 mlp_input = layer.post_attention_layernorm(h)
             else:
+                # 512-lane dispatch diverges from the unfused reference at
+                # fp16 above 64 rows (2^15 grid boundary; probed 2026-08-24,
+                # #319). bf16 is bit-exact at 512, so it keeps the tuned
+                # width; fp16 takes the default 1024-lane loop, bit-exact at
+                # every probed shape. MTPLX_FUSE_POST_NORM_RESIDUAL_TG
+                # overrides both for A/B archaeology only.
                 h, mlp_input = fused_add_rmsnorm(
                     hidden_states,
                     r,
                     layer.post_attention_layernorm.weight,
                     layer.post_attention_layernorm.eps,
-                    threadgroup_size=512,
+                    threadgroup_size=(
+                        override
+                        if (override := _fused_post_norm_tg_override()) is not None
+                        else (512 if hidden_states.dtype == mx.bfloat16 else None)
+                    ),
                 )
         else:
             h = hidden_states + r
@@ -3078,6 +3127,13 @@ def commit_captured_prefix(
     capture_index = keep_tokens - 1
     for capture in captures.values():
         if isinstance(capture, dict):
+            if "conv_states" not in capture:
+                # A family-native capture (Flash-Next's fixed-M4 rows keyed by
+                # its own GDN row names, no conv tape) is committed by the
+                # model's own commit_verified_window; this walker only knows
+                # the qwen3-next conv_states/states layout. Decline instead of
+                # raising KeyError so the caller falls through (#463).
+                return False
             capture_start = int(capture.get("capture_start", 0))
             if capture_index - capture_start < 0:
                 return False

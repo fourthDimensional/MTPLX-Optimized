@@ -11,18 +11,33 @@ from mtplx.server import openai
 GiB = 1024**3
 
 
-def _fake_mx(*, top_level: bool = True):
+def _fake_mx(*, top_level: bool = True, system_wired: int | None = None):
+    """``system_wired`` mimics a stock macOS wired limit: MLX reports it as
+    ``max_recommended_working_set_size`` and refuses a larger wired limit."""
     calls: list[tuple[str, int]] = []
+
+    def _wired(name):
+        def set_wired_limit(value):
+            if system_wired is not None and int(value) > system_wired:
+                raise ValueError(
+                    "Setting a wired limit larger than the maximum working set "
+                    "size is not allowed."
+                )
+            calls.append((name, int(value)))
+
+        return set_wired_limit
 
     metal = SimpleNamespace(
         is_available=lambda: True,
         set_memory_limit=lambda value: calls.append(("metal_memory", int(value))),
-        set_wired_limit=lambda value: calls.append(("metal_wired", int(value))),
+        set_wired_limit=_wired("metal_wired"),
     )
     mx = SimpleNamespace(metal=metal)
     if top_level:
         mx.set_memory_limit = lambda value: calls.append(("memory", int(value)))
-        mx.set_wired_limit = lambda value: calls.append(("wired", int(value)))
+        mx.set_wired_limit = _wired("wired")
+    if system_wired is not None:
+        mx.device_info = lambda: {"max_recommended_working_set_size": system_wired}
     return mx, calls
 
 
@@ -75,6 +90,7 @@ def test_apply_metal_memory_caps_uses_top_level_mlx_apis(monkeypatch):
     assert result["memory_limit_bytes"] == 64 * GiB
     assert result["wired_limit_bytes"] == 48 * GiB
     assert result["memory_limit_api"] == "mx.set_memory_limit"
+    assert result["memory_limit_source"] == "env"
     assert result["wired_limit_api"] == "mx.set_wired_limit"
     assert calls == [("memory", 64 * GiB), ("wired", 48 * GiB)]
 
@@ -91,6 +107,7 @@ def test_apply_metal_memory_caps_caps_large_unified_memory_defaults(monkeypatch)
 
     assert result["applied"] is True
     assert result["memory_limit_bytes"] == 192 * GiB
+    assert result["memory_limit_source"] == "default"
     assert result["wired_limit_bytes"] == 160 * GiB
     assert calls == [("memory", 192 * GiB), ("wired", 160 * GiB)]
 
@@ -203,6 +220,38 @@ def test_laguna_server_uses_safe_default_but_preserves_explicit_context():
     )
 
 
+def test_prefill_preflight_accepts_qwen_yarn_million_token_window(
+    monkeypatch,
+    tmp_path,
+):
+    model = tmp_path / "qwen-yarn"
+    model.mkdir()
+    (model / "config.json").write_text(
+        '{"text_config":{"max_position_embeddings":1048576}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        openai,
+        "_apply_metal_memory_caps",
+        lambda: {"applied": True, "memory_limit_bytes": 110 * GiB},
+    )
+
+    receipt = openai.apply_memory_caps_preflight(
+        entry="bench.prefill_ladder",
+        model=str(model),
+        contexts=[524_288, 1_048_576],
+    )
+    assert receipt["model_context_window"] == 1_048_576
+    assert receipt["requested_contexts"] == [524_288, 1_048_576]
+
+    with pytest.raises(ValueError, match="1,048,577 tokens exceeds"):
+        openai.apply_memory_caps_preflight(
+            entry="bench.prefill_ladder",
+            model=str(model),
+            contexts=[1_048_577],
+        )
+
+
 def test_apply_metal_memory_caps_falls_back_to_deprecated_metal_apis(monkeypatch):
     mx, calls = _fake_mx(top_level=False)
     monkeypatch.setenv("MTPLX_MEMORY_LIMIT_BYTES", "32G")
@@ -233,3 +282,135 @@ def test_apply_metal_memory_caps_skips_when_ram_unknown_without_overrides(
 
     assert result == {"applied": False, "reason": "ram_unknown"}
     assert calls == []
+
+
+# Issue #400: the flat 16 GiB reserve + 6 GiB floor margin refused the
+# Flash-Next Optimized Speed pack on 96 GB Macs by exactly its own margin
+# (77.3 + 6 + 16 = 99.3 > 96) while the machine demonstrably serves it
+# with ~16 GiB left unwired. Both terms scale below 128 GB now; 128 GB+
+# behavior is unchanged.
+
+
+def test_system_reserve_scales_below_128g_and_holds_above():
+    assert openai._metal_system_reserve_bytes(256 * GiB) == 16 * GiB
+    assert openai._metal_system_reserve_bytes(128 * GiB) == 16 * GiB
+    assert openai._metal_system_reserve_bytes(96 * GiB) == 12 * GiB
+    assert openai._metal_system_reserve_bytes(64 * GiB) == 8 * GiB
+    assert openai._metal_system_reserve_bytes(32 * GiB) == 8 * GiB
+
+
+def test_resident_floor_margin_scales_below_112g_and_holds_above():
+    assert openai._resident_floor_margin_bytes(None) == 6 * GiB
+    assert openai._resident_floor_margin_bytes(256 * GiB) == 6 * GiB
+    assert openai._resident_floor_margin_bytes(128 * GiB) == 6 * GiB
+    assert openai._resident_floor_margin_bytes(96 * GiB) == 3 * GiB
+    assert openai._resident_floor_margin_bytes(64 * GiB) == 2 * GiB
+
+
+def test_flash_next_optimized_speed_pack_admits_on_96g(monkeypatch):
+    # The #400 receipt machine: 77.3 GiB of weight files on a 96 GB M2
+    # Max. floor = weights + margin(96G) = 80.3; reserve(96G) = 12;
+    # 92.3 <= 96 admits, and the wired cap rises to the floor.
+    mx, calls = _fake_mx(top_level=True)
+    monkeypatch.delenv("MTPLX_MEMORY_LIMIT_BYTES", raising=False)
+    monkeypatch.delenv("MTPLX_WIRED_LIMIT_BYTES", raising=False)
+    weights = int(77.3 * GiB)
+    floor = weights + openai._resident_floor_margin_bytes(96 * GiB)
+
+    result = openai._apply_metal_memory_caps(
+        mx_module=mx,
+        total_ram_bytes=96 * GiB,
+        minimum_resident_bytes=floor,
+    )
+
+    assert result["applied"] is True
+    assert result["wired_limit_bytes"] == floor
+    assert result["minimum_resident_bytes"] == floor
+    # The unwired remainder stays at/above the scaled system reserve.
+    assert 96 * GiB - floor >= openai._metal_system_reserve_bytes(96 * GiB)
+
+
+def test_oversized_pack_still_refuses_on_96g(monkeypatch):
+    mx, calls = _fake_mx(top_level=True)
+    monkeypatch.delenv("MTPLX_MEMORY_LIMIT_BYTES", raising=False)
+    monkeypatch.delenv("MTPLX_WIRED_LIMIT_BYTES", raising=False)
+
+    result = openai._apply_metal_memory_caps(
+        mx_module=mx,
+        total_ram_bytes=96 * GiB,
+        minimum_resident_bytes=90 * GiB,
+    )
+
+    assert result["applied"] is False
+    assert result["reason"] == "insufficient_ram"
+    assert result["minimum_system_reserve_bytes"] == 12 * GiB
+    assert calls == []
+
+
+# A stock Mac's wired limit (iogpu.wired_limit_mb, about 75% of RAM) can sit
+# under a family's wired floor. MLX refuses the larger request, and before
+# the clamp that refusal left the model with no wiring and no keepalive.
+
+
+def test_wired_floor_above_the_system_limit_is_clamped_not_dropped(monkeypatch):
+    # Flash-Next Speed on a stock 96 GB Mac: floor 80.3 GiB, system 72 GiB.
+    mx, calls = _fake_mx(top_level=True, system_wired=72 * GiB)
+    monkeypatch.delenv("MTPLX_MEMORY_LIMIT_BYTES", raising=False)
+    monkeypatch.delenv("MTPLX_WIRED_LIMIT_BYTES", raising=False)
+    floor = int(77.3 * GiB) + openai._resident_floor_margin_bytes(96 * GiB)
+
+    result = openai._apply_metal_memory_caps(
+        mx_module=mx,
+        total_ram_bytes=96 * GiB,
+        minimum_resident_bytes=floor,
+    )
+
+    assert result["applied"] is True
+    assert "wired_limit_error" not in result
+    assert result["wired_limit_bytes"] == 72 * GiB
+    assert result["wired_limit_requested_bytes"] == floor
+    assert result["system_wired_limit_bytes"] == 72 * GiB
+    assert calls == [("memory", 84 * GiB), ("wired", 72 * GiB)]
+
+
+def test_keepalive_arms_at_the_clamped_wired_limit(monkeypatch):
+    mx, _calls = _fake_mx(top_level=True, system_wired=72 * GiB)
+    monkeypatch.delenv("MTPLX_MEMORY_LIMIT_BYTES", raising=False)
+    monkeypatch.delenv("MTPLX_WIRED_LIMIT_BYTES", raising=False)
+    monkeypatch.delenv("MTPLX_GPU_KEEPALIVE", raising=False)
+    monkeypatch.setattr(openai, "_make_gpu_residency_touch", lambda: (lambda: None))
+    armed = []
+    state = SimpleNamespace(
+        metal_memory_caps=openai._apply_metal_memory_caps(
+            mx_module=mx,
+            total_ram_bytes=96 * GiB,
+            minimum_resident_bytes=int(80.3 * GiB),
+        ),
+        model_scheduler=SimpleNamespace(
+            arm_idle_keepalive=lambda touch, **kw: armed.append(kw)
+        ),
+    )
+
+    receipt = openai._arm_gpu_keepalive(state)
+
+    assert receipt["enabled"] is True
+    assert receipt["wired_limit_bytes"] == 72 * GiB
+    assert len(armed) == 1
+
+
+def test_wired_limit_under_the_system_limit_is_untouched(monkeypatch):
+    # Flash-Next Speed on a stock 128 GB Mac: floor 83.3 GiB, system 96 GiB.
+    mx, calls = _fake_mx(top_level=True, system_wired=96 * GiB)
+    monkeypatch.delenv("MTPLX_MEMORY_LIMIT_BYTES", raising=False)
+    monkeypatch.delenv("MTPLX_WIRED_LIMIT_BYTES", raising=False)
+    floor = int(77.3 * GiB) + openai._resident_floor_margin_bytes(128 * GiB)
+
+    result = openai._apply_metal_memory_caps(
+        mx_module=mx,
+        total_ram_bytes=128 * GiB,
+        minimum_resident_bytes=floor,
+    )
+
+    assert result["wired_limit_bytes"] == floor
+    assert "wired_limit_requested_bytes" not in result
+    assert calls == [("memory", 96 * GiB), ("wired", floor)]

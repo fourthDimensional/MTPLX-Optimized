@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import SwiftUI
 import MTPLXAppCore
@@ -7,22 +8,68 @@ import MTPLXAppCore
 // Top-left model selector. It mirrors the inference popover language:
 // notch, raised surface, monospaced section labels, and row reveal.
 
-struct ModelPickerOverlay: View {
-    @EnvironmentObject private var backend: MTPLXBackendStore
+struct ModelPickerOverlay: View, Equatable {
+    let backend: MTPLXBackendStore
+    let configuration: MTPLXAppConfiguration
+    let daemonState: DaemonState
+    let modelUpdates: [ModelUpdateInfo]
+    let modelPackUpdatingRepoID: String?
+    let modelPackUpdateStatus: String?
+    let modelPackUpdateNeedsRestart: ModelUpdateInfo?
+
     @EnvironmentObject private var themeStore: ThemeStore
 
     @Binding var presented: Bool
+    private let presentedValue: Bool
+
+    init(
+        backend: MTPLXBackendStore,
+        configuration: MTPLXAppConfiguration,
+        daemonState: DaemonState,
+        presented: Binding<Bool>,
+        modelUpdates: [ModelUpdateInfo] = [],
+        modelPackUpdatingRepoID: String? = nil,
+        modelPackUpdateStatus: String? = nil,
+        modelPackUpdateNeedsRestart: ModelUpdateInfo? = nil
+    ) {
+        self.backend = backend
+        self.configuration = configuration
+        self.daemonState = daemonState
+        self.modelUpdates = modelUpdates
+        self.modelPackUpdatingRepoID = modelPackUpdatingRepoID
+        self.modelPackUpdateStatus = modelPackUpdateStatus
+        self.modelPackUpdateNeedsRestart = modelPackUpdateNeedsRestart
+        _presented = presented
+        presentedValue = presented.wrappedValue
+    }
+
+    nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.presentedValue == rhs.presentedValue
+            && lhs.configuration == rhs.configuration
+            && lhs.daemonState == rhs.daemonState
+            && lhs.modelUpdates == rhs.modelUpdates
+            && lhs.modelPackUpdatingRepoID == rhs.modelPackUpdatingRepoID
+            && lhs.modelPackUpdateStatus == rhs.modelPackUpdateStatus
+            && lhs.modelPackUpdateNeedsRestart == rhs.modelPackUpdateNeedsRestart
+    }
 
     @State private var borderProgress: CGFloat = 0
     @State private var headerVisible: Bool = false
     @State private var rowsVisibleCount: Int = 0
     @State private var applyingModelID: String? = nil
     @State private var errorMessage: String? = nil
+    @State private var pendingRemoveID: String?
     @State private var addRowExpanded: Bool = false
     @State private var customRepoInput: String = ""
+    /// The input the visible verdict (probe or error) was produced for.
+    /// Filling the field from the folder panel changes the input in the
+    /// same pass as the verdict; without this, the field's onChange would
+    /// clear that verdict as if the user had typed over it.
+    @State private var verdictInput: String = ""
     @State private var customProbe: OtherModelProbe? = nil
-    @State private var customNoMTPAcknowledged: Bool = false
     @State private var checkingCustomRepo: Bool = false
+    @State private var removalCandidate: ModelRemovalCandidate?
+    @State private var removingModelID: String?
     @State private var preparedRows: [ModelPickerPreparedOption] = []
     @State private var preparedRowsSignature: ModelPickerCatalogSignature?
     @State private var prepareRowsTask: Task<Void, Never>?
@@ -59,10 +106,10 @@ struct ModelPickerOverlay: View {
             hardwareTask?.cancel()
             hardwareTask = nil
         }
-        .onChange(of: backend.configuration.model) { _, _ in
+        .onChange(of: configuration.model) { _, _ in
             preparePickerRows()
         }
-        .onChange(of: backend.configuration.customModels) { _, _ in
+        .onChange(of: configuration.customModels) { _, _ in
             preparePickerRows()
         }
         .onChange(of: detectedHardware) { _, _ in
@@ -70,6 +117,39 @@ struct ModelPickerOverlay: View {
         }
         .onChange(of: presented) { _, isOn in
             if isOn { runEnterChoreography() } else { runExitChoreography() }
+        }
+        .task(id: presented) {
+            // Opening the picker is the natural moment to look for pack
+            // updates; the store throttles to one network check per 6 h.
+            guard presented else { return }
+            await backend.refreshModelUpdates()
+        }
+        .confirmationDialog(
+            tr("Remove this model from MTPLX?"),
+            isPresented: removePresented,
+            titleVisibility: .visible
+        ) {
+            Button(tr("Remove from picker"), role: .destructive) {
+                if let id = pendingRemoveID {
+                    removeFromPicker(id: id)
+                }
+                pendingRemoveID = nil
+            }
+            Button(tr("Cancel"), role: .cancel) {
+                pendingRemoveID = nil
+            }
+        } message: {
+            Text(tr("This unregisters the model from the picker only — the files on disk stay intact. Delete the folder from Finder if you want to free the space."))
+        }
+        .alert(item: $removalCandidate) { candidate in
+            Alert(
+                title: Text(tr("Remove %@?", candidate.displayName)),
+                message: Text(removalConfirmationMessage(candidate)),
+                primaryButton: .destructive(Text(tr("Remove"))) {
+                    removeCachedModel(candidate)
+                },
+                secondaryButton: .cancel(Text(tr("Cancel")))
+            )
         }
     }
 
@@ -109,6 +189,9 @@ struct ModelPickerOverlay: View {
         let rows = preparedRows
         VStack(alignment: .leading, spacing: 0) {
             header
+            if modelPackUpdateNeedsRestart != nil || !availablePackUpdates.isEmpty {
+                modelUpdatesBanner
+            }
             sectionDivider(precedesRow: 1)
             ScrollView(.vertical, showsIndicators: rows.count > 4) {
                 VStack(alignment: .leading, spacing: 0) {
@@ -142,14 +225,14 @@ struct ModelPickerOverlay: View {
                     .trim(from: 0, to: borderProgress)
                     .stroke(Brand.separatorStrong, lineWidth: 0.75)
             }
-            .shadow(color: .black.opacity(0.55), radius: 18, x: 0, y: 10)
+            .shadow(color: Brand.shade.opacity(0.55), radius: 18, x: 0, y: 10)
         )
     }
 
     @ViewBuilder
     private var header: some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text("Model")
+            Text(tr("Model"))
                 .font(.system(.callout, design: .rounded).weight(.semibold))
                 .foregroundStyle(Brand.typeBody)
             Text(restartHint)
@@ -163,20 +246,163 @@ struct ModelPickerOverlay: View {
         .offset(y: headerVisible ? 0 : -6)
     }
 
+    private var availablePackUpdates: [ModelUpdateInfo] {
+        modelUpdates.filter { $0.isUpdateAvailable && $0.canUpdateInPlace }
+    }
+
+    private func updateSizeText(_ update: ModelUpdateInfo) -> String? {
+        guard let bytes = update.updateBytes, bytes > 0 else { return nil }
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        return formatter.string(fromByteCount: bytes)
+    }
+
+    /// Sparkle-for-models strip: one row per pack with a newer published
+    /// revision, plus the restart affordance once an update has landed for
+    /// the pack the running daemon serves.
+    @ViewBuilder
+    private var modelUpdatesBanner: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let restart = modelPackUpdateNeedsRestart {
+                HStack(spacing: 8) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Brand.typeBody)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(tr("%@ updated", restart.shortName))
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(Brand.typeBody)
+                        Text(tr("Restart MTPLX to load the updated files."))
+                            .font(.caption2)
+                            .foregroundStyle(Brand.typeTertiary)
+                    }
+                    Spacer(minLength: 8)
+                    Button(tr("Restart")) {
+                        Task { await backend.restartToApplyModelUpdate() }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                }
+            }
+            ForEach(availablePackUpdates.prefix(3)) { update in
+                HStack(spacing: 8) {
+                    Image(systemName: "arrow.down.circle")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Brand.typeBody)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(
+                            updateSizeText(update).map {
+                                tr("Update available: %@ (%@)", update.shortName, $0)
+                            } ?? tr("Update available: %@", update.shortName)
+                        )
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(Brand.typeBody)
+                        .lineLimit(1)
+                        if let note = update.note, !note.isEmpty {
+                            Text(note)
+                                .font(.caption2)
+                                .foregroundStyle(Brand.typeTertiary)
+                                .lineLimit(2)
+                        }
+                        if modelPackUpdatingRepoID == update.repoID,
+                           let status = modelPackUpdateStatus {
+                            Text(status)
+                                .font(.caption2)
+                                .foregroundStyle(Brand.typeTertiary)
+                                .lineLimit(1)
+                        }
+                    }
+                    Spacer(minLength: 8)
+                    if modelPackUpdatingRepoID == update.repoID {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Button(tr("Update")) {
+                            backend.updateModelPack(update)
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(modelPackUpdatingRepoID != nil)
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .frame(width: popoverWidth, alignment: .leading)
+        .background(Brand.separatorStrong.opacity(0.18))
+    }
+
     @ViewBuilder
     private func modelRow(_ row: ModelPickerPreparedOption, visible: Bool) -> some View {
+        let removalReference = row.installedPath.flatMap {
+            backend.cachedModelReference(forInstalledPath: $0)
+        }
         ModelRowView(
             displayName: row.displayName,
-            detail: row.detail,
+            detail: row.option.localizedDetail,
             isInstalled: row.isInstalled,
             selected: row.selected,
             applying: applyingModelID == row.id,
+            removing: removingModelID == row.id,
             restartRequired: restartRequired,
-            disabled: applyingModelID != nil || checkingCustomRepo || isTransitioning,
+            disabled: applyingModelID != nil
+                || removingModelID != nil
+                || checkingCustomRepo
+                || isTransitioning,
             visible: visible,
             motionEnabled: motionEnabled,
-            action: { select(row) }
+            action: { select(row) },
+            canRemoveFromPicker: row.canRemoveFromPicker,
+            removeAction: { pendingRemoveID = row.id },
+            removalAction: (!row.selected && removalReference != nil) ? {
+                guard let installedPath = row.installedPath,
+                      let removalReference
+                else { return }
+                removalCandidate = ModelRemovalCandidate(
+                    modelID: row.id,
+                    repoID: removalReference,
+                    displayName: row.displayName,
+                    installedPath: installedPath,
+                    approximateSizeBytes: row.option.sizeBytes
+                )
+            } : nil
         )
+    }
+
+    private func removalConfirmationMessage(_ candidate: ModelRemovalCandidate) -> String {
+        var lines = [tr("Deletes the downloaded files at %@.", candidate.installedPath)]
+        if candidate.approximateSizeBytes > 0 {
+            let formatter = ByteCountFormatter()
+            formatter.countStyle = .file
+            let size = formatter.string(fromByteCount: candidate.approximateSizeBytes)
+            lines.append(tr("This should free about %@.", size))
+        }
+        lines.append(tr("Can't be undone."))
+        return lines.joined(separator: "\n\n")
+    }
+
+    private func removeCachedModel(_ candidate: ModelRemovalCandidate) {
+        guard removingModelID == nil, applyingModelID == nil, !isTransitioning else { return }
+        removingModelID = candidate.modelID
+        errorMessage = nil
+        Task {
+            do {
+                _ = try await backend.removeCachedModel(
+                    repoID: candidate.repoID,
+                    installedPath: candidate.installedPath
+                )
+                await MainActor.run {
+                    removingModelID = nil
+                    preparePickerRows()
+                }
+            } catch {
+                await MainActor.run {
+                    removingModelID = nil
+                    errorMessage = error.localizedDescription
+                }
+            }
+        }
     }
 
     @ViewBuilder
@@ -187,7 +413,6 @@ struct ModelPickerOverlay: View {
                 withAnimation(motionEnabled ? .spring(response: 0.30, dampingFraction: 0.86) : nil) {
                     addRowExpanded.toggle()
                     customProbe = nil
-                    customNoMTPAcknowledged = false
                     errorMessage = nil
                 }
                 if addRowExpanded {
@@ -210,14 +435,14 @@ struct ModelPickerOverlay: View {
                         .frame(width: 22, height: 22)
                         .background(
                             Circle()
-                                .fill(Color.white.opacity(0.04))
+                                .fill(Brand.wash.opacity(0.04))
                                 .overlay(Circle().stroke(Brand.separator, lineWidth: 0.5))
                         )
                     VStack(alignment: .leading, spacing: 4) {
-                        Text("Add a model from Hugging Face")
+                        Text(tr("Add a model"))
                             .font(.system(size: 13, weight: .semibold, design: .rounded))
                             .foregroundStyle(Brand.typeBody)
-                        Text("Paste any org/repo. Added models stay in this list.")
+                        Text(tr("Paste a Hugging Face org/repo or choose a model folder on this Mac. Added models stay in this list."))
                             .font(.caption2)
                             .foregroundStyle(Brand.typeTertiary)
                             .lineLimit(2)
@@ -266,7 +491,7 @@ struct ModelPickerOverlay: View {
             && !checkingCustomRepo
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 8) {
-                TextField("org/repo", text: $customRepoInput)
+                TextField("org/repo or /path/to/model-folder", text: $customRepoInput)
                     .textFieldStyle(.plain)
                     .focused($customRepoFocused)
                     .font(.system(size: 12, design: .monospaced))
@@ -291,12 +516,36 @@ struct ModelPickerOverlay: View {
                                     )
                             )
                     )
-                    .onChange(of: customRepoInput) { _, _ in
+                    .onChange(of: customRepoInput) { _, newValue in
+                        guard newValue != verdictInput else { return }
                         customProbe = nil
-                        customNoMTPAcknowledged = false
                         errorMessage = nil
                     }
                     .onSubmit { checkAndAddCustomModel() }
+                // Same fill and radius as the field so the pair reads as
+                // one control: the field for typing, the folder for
+                // browsing. The panel result runs the same add path as
+                // a typed folder.
+                Button {
+                    chooseLocalFolder()
+                } label: {
+                    Image(systemName: "folder")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Brand.typeBody)
+                        .frame(width: 30, height: 30)
+                        .background(
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .fill(Brand.bgOuter)
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                        .stroke(Brand.separator, lineWidth: 0.5)
+                                )
+                        )
+                        .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                }
+                .buttonStyle(.plain)
+                .disabled(checkingCustomRepo || applyingModelID != nil || isTransitioning)
+                .help(tr("Choose a model folder"))
                 Button {
                     checkAndAddCustomModel()
                 } label: {
@@ -306,7 +555,7 @@ struct ModelPickerOverlay: View {
                                 .controlSize(.mini)
                                 .tint(Brand.bgOuter)
                         }
-                        Text(checkingCustomRepo ? "Checking…" : "Check & Add")
+                        Text(checkingCustomRepo ? tr("Checking…") : tr("Check & Add"))
                             .font(.system(size: 12, weight: .semibold))
                     }
                     .padding(.horizontal, 12)
@@ -330,11 +579,7 @@ struct ModelPickerOverlay: View {
                 .animation(motionEnabled ? .smooth(duration: 0.16) : nil, value: canSubmit)
             }
             if let probe = customProbe {
-                CustomModelProbeRow(
-                    probe: probe,
-                    acknowledgedNoMTP: $customNoMTPAcknowledged,
-                    onAddAnyway: { addCustomModel(repoID: probe.hfRepo) }
-                )
+                CustomModelProbeRow(probe: probe)
             }
         }
         .padding(.horizontal, 14)
@@ -397,17 +642,35 @@ struct ModelPickerOverlay: View {
                 print("MTPLX: model switch failed: \(error)")
                 await MainActor.run {
                     applyingModelID = nil
-                    errorMessage = "Couldn't switch models. Try again."
+                    errorMessage = tr("Couldn't switch models. Try again.")
                 }
             }
         }
     }
 
+    private var removePresented: Binding<Bool> {
+        Binding(
+            get: { pendingRemoveID != nil },
+            set: { if !$0 { pendingRemoveID = nil } }
+        )
+    }
+
+    private func removeFromPicker(id: String) {
+        var next = backend.configuration
+        guard next.removeCustomModel(id: id) else { return }
+        try? backend.saveSettings(next)
+    }
+
     private func checkAndAddCustomModel() {
         guard !checkingCustomRepo, applyingModelID == nil, !isTransitioning else { return }
+        // A path is checked on disk; anything else is a Hugging Face id.
+        if MTPLXModelOption.localFolderModel(path: customRepoInput) != nil {
+            addLocalFolderModel(input: customRepoInput)
+            return
+        }
         guard let option = MTPLXModelOption.customHuggingFaceModel(repoID: customRepoInput) else {
             customProbe = nil
-            errorMessage = "Enter a Hugging Face repo id like org/name."
+            errorMessage = tr("Enter a Hugging Face repo id like org/name.")
             return
         }
         if let existing = preparedRows.first(where: { $0.matches(option.hfModelID) }) {
@@ -423,12 +686,12 @@ struct ModelPickerOverlay: View {
                 checkingCustomRepo = false
                 customProbe = result
                 switch result.verdict {
-                case .ready, .missingSidecar:
+                case .ready, .missingSidecar, .noMTP:
+                    // MTP unavailable is informational, never a gate
+                    // (founder directive 2026-08-26): the engine serves
+                    // MTP-less checkpoints autoregressive, so the app adds
+                    // them exactly like the CLI runs them.
                     addCustomModel(repoID: result.hfRepo)
-                case .noMTP:
-                    if customNoMTPAcknowledged {
-                        addCustomModel(repoID: result.hfRepo)
-                    }
                 case .probeFailed:
                     break
                 }
@@ -438,7 +701,7 @@ struct ModelPickerOverlay: View {
 
     private func addCustomModel(repoID: String) {
         guard let option = MTPLXModelOption.customHuggingFaceModel(repoID: repoID) else {
-            errorMessage = "Enter a Hugging Face repo id like org/name."
+            errorMessage = tr("Enter a Hugging Face repo id like org/name.")
             return
         }
         guard applyingModelID == nil, !isTransitioning else { return }
@@ -455,7 +718,6 @@ struct ModelPickerOverlay: View {
                     applyingModelID = nil
                     customRepoInput = ""
                     customProbe = nil
-                    customNoMTPAcknowledged = false
                     addRowExpanded = false
                     presented = false
                 }
@@ -463,10 +725,79 @@ struct ModelPickerOverlay: View {
                 print("MTPLX: add custom model failed: \(error)")
                 await MainActor.run {
                     applyingModelID = nil
-                    errorMessage = "Couldn't add that model. Check the repo and try again."
+                    errorMessage = tr("Couldn't add that model. Check the repo and try again.")
                 }
             }
         }
+    }
+
+    /// Local half of the add form. The folder is checked on disk with the
+    /// same completeness contract onboarding applies (never a network
+    /// probe), then remembered as a picker row and selected exactly like
+    /// a Hugging Face repo — so the next switch back to it is a click.
+    private func addLocalFolderModel(input: String) {
+        guard let option = MTPLXModelOption.localFolderModel(path: input) else { return }
+        guard applyingModelID == nil, !checkingCustomRepo, !isTransitioning else { return }
+        customProbe = nil
+        verdictInput = input
+        let folder = option.hfModelID
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: folder, isDirectory: &isDirectory),
+              isDirectory.boolValue
+        else {
+            errorMessage = tr("That folder doesn't exist on this Mac.")
+            return
+        }
+        guard MTPLXModelOption.hasCompleteInstall(at: folder) else {
+            errorMessage = tr("That folder is not a complete MTPLX model yet.")
+            return
+        }
+        applyingModelID = option.id
+        errorMessage = nil
+        var next = backend.configuration
+        next.rememberLocalFolderModel(path: input)
+        next.model = option.resolvedReference
+        normalizeModelScopedDefaults(&next)
+        Task {
+            do {
+                try await backend.applyConfiguration(next, restartIfRunning: true)
+                await MainActor.run {
+                    applyingModelID = nil
+                    customRepoInput = ""
+                    customProbe = nil
+                    addRowExpanded = false
+                    presented = false
+                }
+            } catch {
+                print("MTPLX: add local model folder failed: \(error)")
+                await MainActor.run {
+                    applyingModelID = nil
+                    errorMessage = tr("Couldn't switch models. Try again.")
+                }
+            }
+        }
+    }
+
+    /// Native folder picker for the add form. The chosen path lands in
+    /// the field (so a rejected folder stays visible and editable) and
+    /// goes through `addLocalFolderModel` like a typed path.
+    private func chooseLocalFolder() {
+        guard !checkingCustomRepo, applyingModelID == nil, !isTransitioning else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = false
+        panel.prompt = tr("Use Folder")
+        panel.message = tr("Choose a complete MTPLX model folder on this Mac.")
+        if let typed = MTPLXModelOption.localFolderModel(path: customRepoInput)?.hfModelID,
+           FileManager.default.fileExists(atPath: typed)
+        {
+            panel.directoryURL = URL(fileURLWithPath: typed, isDirectory: true)
+        }
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        customRepoInput = url.path
+        addLocalFolderModel(input: url.path)
     }
 
     private func normalizeModelScopedDefaults(_ config: inout MTPLXAppConfiguration) {
@@ -485,7 +816,7 @@ struct ModelPickerOverlay: View {
         config.prefillChunkTokens = nil
 
         switch family {
-        case "qwen3_5", "qwen3_6", "qwen3_8", "gemma4", "step":
+        case "qwen3_5", "qwen3_6", "qwen3_8", "qwen4_exp", "gemma4", "step":
             config.generationMode = "mtp"
             config.loadMTP = true
             config.liveSettingsModelFamily = family
@@ -497,14 +828,14 @@ struct ModelPickerOverlay: View {
     }
 
     private var restartRequired: Bool {
-        switch backend.daemonState.kind {
+        switch daemonState.kind {
         case .running: return true
         default: return false
         }
     }
 
     private var isTransitioning: Bool {
-        switch backend.daemonState.kind {
+        switch daemonState.kind {
         case .starting, .warming, .stopping: return true
         default: return false
         }
@@ -512,23 +843,25 @@ struct ModelPickerOverlay: View {
 
     private var restartHint: String {
         if isTransitioning {
-            return "Wait for startup or shutdown to finish."
+            return tr("Wait for startup or shutdown to finish.")
         }
         if restartRequired {
-            return "Switching models restarts the model server."
+            return tr("Switching models restarts the model server.")
         }
-        return "This model loads next time you start."
+        return tr("This model loads next time you start.")
     }
 
     private var motionEnabled: Bool {
-        !backend.configuration.performanceLock && !themeStore.reduceMotionPreference
+        !configuration.performanceLock && !themeStore.reduceMotionPreference
     }
 
     private var catalogSignature: ModelPickerCatalogSignature {
         ModelPickerCatalogSignature(
-            currentModel: backend.configuration.model,
-            customModels: backend.configuration.customModels,
-            hardware: detectedHardware
+            currentModel: configuration.model,
+            customModels: configuration.customModels,
+            hardware: detectedHardware,
+            primaryModelDirectory: configuration.primaryModelDirectory,
+            additionalModelDirectories: configuration.additionalModelDirectories
         )
     }
 
@@ -561,6 +894,7 @@ struct ModelPickerOverlay: View {
         let customModels = signature.customModels
         let currentModel = signature.currentModel
         let hardware = signature.hardware
+        let modelLibrary = signature.modelLibrary
 
         prepareRowsTask?.cancel()
         prepareRowsTask = Task { @MainActor in
@@ -568,10 +902,15 @@ struct ModelPickerOverlay: View {
                 MTPLXModelOption.pickerCatalog(
                     customModels: customModels,
                     currentModel: currentModel,
-                    hardware: hardware
+                    hardware: hardware,
+                    modelLibrary: modelLibrary
                 )
                 .map { option in
-                    ModelPickerPreparedOption(option: option, currentModel: currentModel)
+                    ModelPickerPreparedOption(
+                        option: option,
+                        currentModel: currentModel,
+                        customModels: customModels
+                    )
                 }
             }.value
 
@@ -597,7 +936,6 @@ struct ModelPickerOverlay: View {
     private func runExitChoreography() {
         addRowExpanded = false
         customProbe = nil
-        customNoMTPAcknowledged = false
         checkingCustomRepo = false
         customRepoFocused = false
         OverlayChoreography.runExit(
@@ -613,31 +951,45 @@ private struct ModelPickerCatalogSignature: Equatable, Sendable {
     let currentModel: String
     let customModels: [MTPLXModelOption]
     let hardware: DetectedHardware?
+    let primaryModelDirectory: String
+    let additionalModelDirectories: [String]
+
+    var modelLibrary: ModelLibrary {
+        ModelLibrary(
+            primaryDirectory: primaryModelDirectory,
+            additionalDirectories: additionalModelDirectories
+        )
+    }
 }
 
-private struct ModelPickerPreparedOption: Equatable, Identifiable, Sendable {
+struct ModelPickerPreparedOption: Equatable, Identifiable, Sendable {
     let option: MTPLXModelOption
     let id: String
     let displayName: String
-    let detail: String
     let isInstalled: Bool
     let selected: Bool
     let resolvedReference: String
+    let canRemoveFromPicker: Bool
+    let installedPath: String?
 
-    init(option: MTPLXModelOption, currentModel: String) {
+    init(option: MTPLXModelOption, currentModel: String, customModels: [MTPLXModelOption]) {
         let installedLocalPath = option.installedLocalPath
-
-        self.option = option
-        self.id = option.id
-        self.displayName = option.displayName
-        self.detail = option.detail
-        self.isInstalled = installedLocalPath != nil
-        self.resolvedReference = installedLocalPath ?? option.hfModelID
-        self.selected = Self.matches(
+        let selected = Self.matches(
             option: option,
             model: currentModel,
             resolvedReference: installedLocalPath ?? option.hfModelID
         )
+        let isOfficial = MTPLXModelOption.officialCatalog.contains { $0.id == option.id }
+        let isPersistedCustom = !isOfficial && customModels.contains { $0.id == option.id }
+
+        self.option = option
+        self.id = option.id
+        self.displayName = option.displayName
+        self.isInstalled = installedLocalPath != nil
+        self.installedPath = installedLocalPath
+        self.resolvedReference = installedLocalPath ?? option.hfModelID
+        self.selected = selected
+        self.canRemoveFromPicker = isPersistedCustom && installedLocalPath == nil && !selected
     }
 
     func matches(_ model: String) -> Bool {
@@ -672,6 +1024,16 @@ private struct ModelPickerPreparedOption: Equatable, Identifiable, Sendable {
     }
 }
 
+private struct ModelRemovalCandidate: Identifiable {
+    let modelID: String
+    let repoID: String
+    let displayName: String
+    let installedPath: String
+    let approximateSizeBytes: Int64
+
+    var id: String { modelID }
+}
+
 // MARK: - ModelRowView
 //
 // One row in the model picker. Owns its own hover state so the picker
@@ -684,21 +1046,37 @@ private struct ModelPickerPreparedOption: Equatable, Identifiable, Sendable {
 // other: a thin tinted full-width fill (Brand.accentChrome at 8%
 // opacity), a brighter title colour (Brand.typeHi vs typeBody), and a
 // filled blue checkmark on the trailing edge. Hover is an even
-// quieter Color.white opacity-0.04 stripe that the selection fill
+// quieter Brand.wash opacity-0.04 stripe that the selection fill
 // composites on top of, so hovering the selected row still reads as
 // "selected" but with a subtle lift.
+//
+// Every trailing icon (both checks, the restart arrow, the spinner and
+// the trash) is drawn centred in one 28 pt accessory slot that ends on
+// the row's 14 pt inset, so all of them share one vertical axis. The
+// slot sits inside the select button, which keeps the check part of the
+// row's tap target. The trash is a separate button that
+// ModelRowRemovalAccessory lays over the same slot.
 
-private struct ModelRowView: View {
+struct ModelRowView: View {
+    /// Side of the trailing accessory slot every row state draws into.
+    static let accessorySlot: CGFloat = 28
+    /// The row's horizontal inset. The accessory slot ends on it.
+    static let horizontalInset: CGFloat = 14
+
     let displayName: String
     let detail: String
     let isInstalled: Bool
     let selected: Bool
     let applying: Bool
+    let removing: Bool
     let restartRequired: Bool
     let disabled: Bool
     let visible: Bool
     let motionEnabled: Bool
     let action: () -> Void
+    let canRemoveFromPicker: Bool
+    let removeAction: () -> Void
+    let removalAction: (() -> Void)?
 
     @State private var hovering = false
 
@@ -707,11 +1085,17 @@ private struct ModelRowView: View {
             HStack(alignment: .center, spacing: 12) {
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(alignment: .firstTextBaseline, spacing: 9) {
+                        // .middle: builds of one model differ at the end of
+                        // their names (6-bit, a test suffix), which a tail
+                        // cut hides. Single-line, untracked text, the same
+                        // shape AttachmentCard ships; the macOS 26 layout
+                        // spin needs tracking or several lines.
                         Text(displayName)
                             .font(.system(size: 13, weight: .semibold, design: .rounded))
                             .foregroundStyle(selected ? Brand.typeHi : Brand.typeBody)
                             .lineLimit(1)
-                            .truncationMode(.tail)
+                            .truncationMode(.middle)
+                            .help(displayName)
                         statusBadge
                     }
                     Text(detail)
@@ -720,34 +1104,55 @@ private struct ModelRowView: View {
                         .lineLimit(2)
                 }
                 Spacer(minLength: 10)
-                trailingIcon
+                // The ZStack keeps the slot a single view, so an empty
+                // slot still holds its 28 points.
+                ZStack { trailingIcon }
+                    .frame(width: Self.accessorySlot, height: Self.accessorySlot)
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 11)
             .contentShape(Rectangle())
-            // Two flat full-width fills stacked: hover sits on top of
-            // the selection tint so a hovered selected row reads as
-            // selected + lifted. No `RoundedRectangle` here — the
-            // popover's `.clipShape` rounds these stripes at the top
-            // and bottom of the list automatically.
-            .background {
-                ZStack {
-                    if selected {
-                        Brand.accentChrome.opacity(0.10)
-                    }
-                    if hovering {
-                        Color.white.opacity(0.05)
-                    }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .buttonStyle(.plain)
+        .contextMenu {
+            if canRemoveFromPicker {
+                Button(tr("Remove from picker"), role: .destructive, action: removeAction)
+            }
+            if let removalAction {
+                Button(tr("Remove downloaded files"), role: .destructive, action: removalAction)
+            }
+        }
+        .padding(.horizontal, Self.horizontalInset)
+        .padding(.vertical, 11)
+        .overlay(alignment: .trailing) {
+            if let removalAction {
+                ModelRowRemovalAccessory(
+                    displayName: displayName,
+                    busy: applying || removing,
+                    motionEnabled: motionEnabled,
+                    action: removalAction
+                )
+            }
+        }
+        .contentShape(Rectangle())
+        // Two flat full-width fills stacked: hover sits on top of
+        // the selection tint so a hovered selected row reads as
+        // selected + lifted. No rounded inner card is introduced.
+        .background {
+            ZStack {
+                if selected {
+                    Brand.accentChrome.opacity(0.10)
+                }
+                if hovering {
+                    Brand.wash.opacity(0.05)
                 }
             }
         }
-        .buttonStyle(.plain)
         .disabled(disabled)
         .opacity(visible ? 1 : 0)
         .offset(y: visible ? 0 : 8)
         .scaleEffect(hovering ? 1.015 : 1.0, anchor: .center)
         .shadow(
-            color: .black.opacity(hovering ? 0.32 : 0),
+            color: Brand.shade.opacity(hovering ? 0.32 : 0),
             radius: hovering ? 6 : 0,
             x: 0,
             y: hovering ? 3 : 0
@@ -760,9 +1165,12 @@ private struct ModelRowView: View {
         }
     }
 
+    /// What the accessory slot shows. The spinner comes first. Otherwise
+    /// a row with a removable download leaves the slot empty, and
+    /// ModelRowRemovalAccessory reveals its trash there on hover.
     @ViewBuilder
     private var trailingIcon: some View {
-        if applying {
+        if applying || removing {
             ProgressView()
                 .controlSize(.small)
                 .scaleEffect(0.76)
@@ -772,7 +1180,7 @@ private struct ModelRowView: View {
                 .font(.system(size: 15, weight: .semibold))
                 .symbolRenderingMode(.monochrome)
                 .foregroundStyle(Brand.accentChrome)
-        } else {
+        } else if removalAction == nil {
             Image(systemName: restartRequired ? "arrow.clockwise" : "checkmark.circle")
                 .font(.system(size: 14, weight: .semibold))
                 .symbolRenderingMode(.monochrome)
@@ -791,7 +1199,7 @@ private struct ModelRowView: View {
     @ViewBuilder
     private var statusBadge: some View {
         let tint = isInstalled ? Brand.accentChrome : Brand.warning
-        let label = isInstalled ? "Installed" : "HF"
+        let label = isInstalled ? tr("Installed") : tr("HF")
         Text(label)
             .font(.caption2.weight(.medium))
             .foregroundStyle(tint.opacity(0.9))
@@ -804,10 +1212,52 @@ private struct ModelRowView: View {
     }
 }
 
+// MARK: - ModelRowRemovalAccessory
+//
+// The "remove download" control of an installed row, and that row's
+// trailing hover zone: full row height and 56 pt wide (the accessory
+// slot plus the row inset on each side), laid over the row's trailing
+// edge. The trash is framed exactly like ModelRowView's accessory slot,
+// so it sits on the same axis as the checks in the other rows. It fades
+// in only while the pointer is in this zone or the button has keyboard
+// focus, and never over the row's spinner. Only the glyph fades: the
+// button keeps its accessibility label and its place in the key view
+// loop, and the row's context menu offers the same removal.
+
+private struct ModelRowRemovalAccessory: View {
+    let displayName: String
+    let busy: Bool
+    let motionEnabled: Bool
+    let action: () -> Void
+
+    @State private var zoneHovered = false
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        let revealed = !busy && (zoneHovered || focused)
+        Button(action: action) {
+            Image(systemName: "trash")
+                .font(.system(size: 12, weight: .semibold))
+                .symbolRenderingMode(.monochrome)
+                .foregroundStyle(Brand.danger)
+                .opacity(revealed ? 1 : 0)
+                .frame(width: ModelRowView.accessorySlot, height: ModelRowView.accessorySlot)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .focused($focused)
+        .help(tr("Remove downloaded files"))
+        .accessibilityLabel(tr("Remove the %@ download", displayName))
+        .padding(.horizontal, ModelRowView.horizontalInset)
+        .frame(maxHeight: .infinity)
+        .contentShape(Rectangle())
+        .onHover { zoneHovered = $0 }
+        .animation(motionEnabled ? .smooth(duration: 0.16) : nil, value: revealed)
+    }
+}
+
 private struct CustomModelProbeRow: View {
     let probe: OtherModelProbe
-    @Binding var acknowledgedNoMTP: Bool
-    let onAddAnyway: () -> Void
 
     var body: some View {
         let (symbol, color) = icon
@@ -828,25 +1278,6 @@ private struct CustomModelProbeRow: View {
                     .foregroundStyle(Brand.typeTertiary)
                     .padding(.leading, 20)
             }
-            if probe.verdict == .noMTP {
-                HStack(alignment: .center, spacing: 10) {
-                    Toggle(isOn: $acknowledgedNoMTP) {
-                        Text("Add anyway without the speed boost")
-                            .font(.caption)
-                            .foregroundStyle(Brand.typeSecondary)
-                    }
-                    .toggleStyle(.checkbox)
-                    Spacer(minLength: 8)
-                    Button("Add") {
-                        onAddAnyway()
-                    }
-                    .font(.system(size: 11, weight: .semibold))
-                    .buttonStyle(.plain)
-                    .foregroundStyle(acknowledgedNoMTP ? Brand.typeBody : Brand.typeTertiary)
-                    .disabled(!acknowledgedNoMTP)
-                }
-                .padding(.leading, 20)
-            }
         }
         .padding(10)
         .background(
@@ -865,8 +1296,10 @@ private struct CustomModelProbeRow: View {
             return ("checkmark.circle.fill", Brand.success)
         case .missingSidecar:
             return ("exclamationmark.triangle.fill", Brand.warning)
+        // MTP unavailable is informational (the model still runs, AR),
+        // so it wears the warning treatment, never the blocked one.
         case .noMTP:
-            return ("xmark.octagon.fill", Brand.danger)
+            return ("info.circle.fill", Brand.warning)
         case .probeFailed:
             return ("wifi.exclamationmark", Brand.danger)
         }

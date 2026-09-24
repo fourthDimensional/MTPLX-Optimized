@@ -10,6 +10,7 @@ from mtplx.cache_state import (
     TailOwnedKVCache,
     TensorOffsetVllmMetalPagedKVCache,
     VllmMetalPagedKVCache,
+    _dynamic_paged_num_blocks,
     _paged_gqa_sdpa_route_decision_from_env,
     _paged_gqa_sdpa_route_from_env,
     configure_owned_recurrent_state_cache,
@@ -770,6 +771,79 @@ def test_paged_kv_grows_on_dynamic_overflow(monkeypatch):
     assert paged.paged_stats()["grow_events"] == 1
 
 
+def test_install_reconfig_on_live_cache_grows_instead_of_redefining(monkeypatch):
+    """#310 re-config contract: on a LIVE allocated cache, install honors a
+    bigger num_blocks by GROWING the pages — it never redefines geometry on
+    buffers that were not reallocated, and never touches block_size."""
+
+    monkeypatch.setattr("mtplx.cache_state._load_vllm_metal_ops", lambda: object())
+    monkeypatch.setenv("MTPLX_DYNAMIC_PAGED_KV", "1")
+    monkeypatch.delenv("MTPLX_CONTEXT_WINDOW_TOKENS", raising=False)
+
+    paged = VllmMetalPagedKVCache(block_size=4, num_blocks=4)
+    keys = mx.zeros((1, 2, 10, 3), dtype=mx.float32)
+    values = mx.zeros((1, 2, 10, 3), dtype=mx.float32)
+    paged.update_without_fetch(keys, values)
+    assert paged.capacity == 16
+
+    cache = [paged]
+    stats = install_vllm_metal_paged_attention_kv_cache(
+        cache,
+        block_size=16,
+        num_blocks=64,
+    )
+
+    assert cache[0] is paged
+    assert stats["entries"] == 1
+    assert paged.capacity >= 16 * 64  # requested room honored by growing
+    assert paged.capacity == int(paged.key_cache.shape[0]) * int(
+        paged.key_cache.shape[1]
+    )
+    assert paged.num_blocks == int(paged.key_cache.shape[0])
+    assert paged.block_size == 4  # a live buffer is never reinterpreted
+    assert int(paged.offset) == 10
+
+
+def test_meta_state_restore_on_live_cache_keeps_physical_geometry():
+    """#310 restore contract: `state` already rebuilt the pages, so the
+    snapshot's geometry is history — only the offset is restored, and an
+    offset beyond the live pages fails loud instead of truncating."""
+
+    paged = VllmMetalPagedKVCache(block_size=16, num_blocks=4)
+    keys = mx.zeros((1, 2, 10, 3), dtype=mx.float32)
+    values = mx.zeros((1, 2, 10, 3), dtype=mx.float32)
+    paged.update_without_fetch(keys, values)
+    assert paged.capacity == 64
+
+    paged.meta_state = ("16", "4096", "50")
+    assert paged.offset == 50
+    assert paged.num_blocks == int(paged.key_cache.shape[0]) == 4
+    assert paged.capacity == 64
+
+    with pytest.raises(ValueError, match="exceeds page capacity"):
+        paged.meta_state = ("16", "4096", "100")
+
+    # Unallocated cache: the snapshot IS the plan (unchanged behavior).
+    fresh = VllmMetalPagedKVCache(block_size=4, num_blocks=2)
+    fresh.meta_state = ("16", "4096", "100")
+    assert fresh.block_size == 16
+    assert fresh.num_blocks == 4096
+    assert fresh.offset == 100
+
+
+def test_dynamic_paged_num_blocks_floor_is_configured_blocks(monkeypatch):
+    monkeypatch.setenv("MTPLX_DYNAMIC_PAGED_KV", "1")
+    for name in (
+        "MTPLX_DYNAMIC_PAGED_KV_TOKENS",
+        "MTPLX_DYNAMIC_PAGED_KV_MIN_BLOCKS",
+        "MTPLX_DYNAMIC_PAGED_KV_PREVIOUS_HIGH_WATER",
+        "MTPLX_DYNAMIC_PAGED_KV_MARGIN",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    assert _dynamic_paged_num_blocks(block_size=16, configured_blocks=1024) == 1024
+
+
 def test_paged_active_array_assertion_guards_dense_fallback(monkeypatch):
     monkeypatch.setenv("MTPLX_ASSERT_NO_PAGED_ACTIVE_ARRAYS", "1")
     monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_PARTITION_THRESHOLD", "4")
@@ -1335,7 +1409,11 @@ def test_kv_quant_q8_kernel_engages_and_matches_dequant_path(monkeypatch):
     assert float(diff.item()) <= 5e-3
 
 
-def test_kv_quant_q4_never_routes_to_q8_kernel(monkeypatch):
+def test_kv_quant_q4_kernel_route_matches_dequant(monkeypatch):
+    """2026-08-26 route flip: q4 now takes the v5 bits=4 kernel when the
+    geometry allows. Guard the NEW invariants: the kernel route engages
+    exactly once, and its output matches the legacy dequant route (the old
+    "never kernels" behavior, reachable via the revert lever)."""
     if not mx.metal.is_available():
         pytest.skip("Metal is unavailable")
     monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_ATTN_IMPL", "mlx_vector_paged")
@@ -1343,22 +1421,71 @@ def test_kv_quant_q4_never_routes_to_q8_kernel(monkeypatch):
     monkeypatch.setenv("MTPLX_KV_QUANT_2PASS_KERNEL", "1")
 
     mx.random.seed(11311)
-    dim = 128
-    queries = 0.3 * mx.random.normal((1, 8, 2, dim), dtype=mx.bfloat16)
-    keys = 0.5 * mx.random.normal((1, 2, 200, dim), dtype=mx.bfloat16)
-    values = 0.5 * mx.random.normal((1, 2, 200, dim), dtype=mx.bfloat16)
-    cache = VllmMetalPagedKVCache(
-        block_size=16,
-        num_blocks=16,
-        kv_quant_config=PagedKVQuantConfig("q4"),
+    # Shipped geometry (D=256, GQA 6): the q4 kernel's verified envelope.
+    # D=128 deviates from its own dequant math (2026-08-26 forensics) and
+    # now BAILS — pinned below.
+    dim = 256
+    queries = 0.3 * mx.random.normal((1, 24, 2, dim), dtype=mx.bfloat16)
+    keys = 0.5 * mx.random.normal((1, 4, 200, dim), dtype=mx.bfloat16)
+    values = 0.5 * mx.random.normal((1, 4, 200, dim), dtype=mx.bfloat16)
+
+    def _make_cache():
+        cache = VllmMetalPagedKVCache(
+            block_size=16,
+            num_blocks=16,
+            kv_quant_config=PagedKVQuantConfig("q4"),
+        )
+        cache.update_without_fetch(keys, values)
+        return cache
+
+    monkeypatch.setenv("MTPLX_KV_QUANT_Q4_KERNEL", "1")
+    kernel_cache = _make_cache()
+    kernel_out = kernel_cache.paged_attention(
+        queries, scale=dim**-0.5, mask="causal"
     )
-    cache.update_without_fetch(keys, values)
+    assert kernel_out is not None
+    mx.eval(kernel_out)
+    assert kernel_cache.kv_quant_kernel_calls == 1
+    assert kernel_cache.kv_quant_attention_calls == 1
 
-    out = cache.paged_attention(queries, scale=dim**-0.5, mask="causal")
+    monkeypatch.setenv("MTPLX_KV_QUANT_Q4_KERNEL", "0")
+    dequant_cache = _make_cache()
+    dequant_out = dequant_cache.paged_attention(
+        queries, scale=dim**-0.5, mask="causal"
+    )
+    assert dequant_out is not None
+    mx.eval(dequant_out)
+    assert dequant_cache.kv_quant_kernel_calls == 0
 
-    assert out is not None
-    assert cache.kv_quant_kernel_calls == 0
-    assert cache.kv_quant_attention_calls == 1
+    diff = mx.max(
+        mx.abs(kernel_out.astype(mx.float32) - dequant_out.astype(mx.float32))
+    )
+    mx.eval(diff)
+    assert float(diff.item()) <= 5e-3
+
+
+def test_kv_quant_q4_kernel_bails_outside_envelope():
+    """D=128 q4 deviates from its own dequant math (2026-08-26 forensics:
+    0.006-0.026 abs vs <2e-4 at D=256). The kernel must fail closed there."""
+    if not mx.metal.is_available():
+        pytest.skip("Metal is unavailable")
+    from mtplx.kernels.sdpa_gqa_packed_quant import sdpa_gqa_packed_tail_quant
+    from mtplx.kv_quant import quantize_symmetric
+
+    mx.random.seed(5)
+    dim = 128
+    q = 0.3 * mx.random.normal((1, 8, 2, dim)).astype(mx.bfloat16)
+    k = 0.5 * mx.random.normal((1, 2, 392, dim)).astype(mx.bfloat16)
+    v = 0.5 * mx.random.normal((1, 2, 392, dim)).astype(mx.bfloat16)
+    kq, ks = quantize_symmetric(k, bits=4)
+    vq, vs = quantize_symmetric(v, bits=4)
+    mx.eval(q, kq, ks, vq, vs)
+    out = sdpa_gqa_packed_tail_quant(
+        queries=q, k_q=kq, k_scale=ks.astype(mx.float32),
+        v_q=vq, v_scale=vs.astype(mx.float32),
+        offset=200, scale=dim**-0.5, bits=4,
+    )
+    assert out is None
 
 
 def test_install_hybrid_cache_counts_attention_entries_and_skips_rest(monkeypatch):
@@ -1830,7 +1957,10 @@ def test_promote_default_still_follows_env_for_paged_entries(monkeypatch):
     assert isinstance(cache[0], TensorOffsetVllmMetalPagedKVCache)
 
 
-def test_promote_preserve_paged_refuses_quantized_paged_entries(monkeypatch):
+def test_promote_preserve_paged_refuses_out_of_class_quantized_entries(monkeypatch):
+    """2026-08-26: quantized paged entries in the supported v5 geometry now
+    PROMOTE (see the quantized-adapter tests); an out-of-class geometry
+    (D=16 here) must still fail closed with the geometry reason."""
     from mtplx.graphbank import promote_kv_cache_offsets
 
     monkeypatch.delenv("MTPLX_GRAPHBANK_PRESERVE_PAGED_KV", raising=False)
@@ -1850,7 +1980,7 @@ def test_promote_preserve_paged_refuses_quantized_paged_entries(monkeypatch):
     )
 
     assert promoted == 0
-    assert failures == {"quantized_paged_kv_cache": 1}
+    assert failures == {"quantized_paged_kv_geometry": 1}
     assert cache[0] is quantized
 
 

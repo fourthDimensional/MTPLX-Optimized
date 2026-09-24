@@ -15,8 +15,11 @@ import os
 import shutil
 import subprocess
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
+
+from mtplx.jsonc import load_config_file
 
 OPENCODE_PROVIDER_ID = "mtplx"
 OPENCODE_NPM_PACKAGE = "@ai-sdk/openai-compatible"
@@ -24,16 +27,64 @@ OPENCODE_DEFAULT_CONTEXT_WINDOW = 262_144
 OPENCODE_DEFAULT_CHUNK_TIMEOUT_MS = 900_000
 # OpenCode's own injected output ceiling when the user never set a cap. The
 # plugin strips exactly this value: anything else is a deliberate client cap
-# and must reach MTPLX intact.
-OPENCODE_INJECTED_OUTPUT_CAP = 32_768
+# and must reach MTPLX intact. Receipts: sst/opencode v1.18.21
+# provider/transform.ts `OUTPUT_TOKEN_MAX = 32_000` (min'd against
+# limit.output on every request), and request-log-8002.jsonl records 313-327
+# all showing request_max_tokens=32000. The earlier 32_768 guess never
+# matched the wire, so the guard silently stripped nothing.
+OPENCODE_INJECTED_OUTPUT_CAP = 32_000
+
+
+def opencode_output_limit(context_window: int, requested: int | None = None) -> int:
+    """The reply budget OpenCode may plan around, never the whole window.
+
+    OpenCode 1.18.29 keeps ``min(limit.output, 32_000)`` of ``limit.context``
+    for the reply and compacts the moment a turn's total tokens reach the
+    rest (session/overflow.ts ``usable`` / ``isOverflow``). Mirroring the
+    context into ``limit.output`` therefore left a zero-token conversation
+    window on any context <= 32K (8,192 on a 32 GB seat), and the compaction
+    agent ran after every reply (issue #480: 48 summaries in 98 turns, no
+    turn past 7,801 tokens). Reserve at most half the window, capped at the
+    32,000 OpenCode injects on large windows (which the session-headers
+    plugin strips, so the server's own defaults still apply there).
+    """
+    context = max(1, int(context_window))
+    cap = max(1, min(OPENCODE_INJECTED_OUTPUT_CAP, context // 2))
+    if requested is not None and int(requested) > 0:
+        return max(1, min(int(requested), cap))
+    return cap
+# OpenCode <= 1.18.20 (including Desktop 1.18.18) injects a qwen-keyed
+# sampler for any model id containing "qwen" (provider/transform.ts
+# `temperature()`/`topP()` at v1.18.18); 1.18.21 removed the rule. The plugin
+# strips exactly this injected pair so the server's family-native sampler
+# (the app's source of truth) applies; any other value is a deliberate
+# client choice and passes through.
+OPENCODE_INJECTED_QWEN_TEMPERATURE = 0.55
+OPENCODE_INJECTED_QWEN_TOP_P = 1
+# OpenCode's built-in effort tiers for reasoning-capable openai-compatible
+# models (provider/transform.ts OPENAI_EFFORTS at v1.18.18/v1.18.21). The
+# generated config disables the tiers a family contract does not define so
+# OpenCode's effort picker mirrors the MTPLX dial exactly.
+OPENCODE_OPENAI_COMPATIBLE_DEFAULT_EFFORTS = (
+    "none",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+)
 OPENCODE_SESSION_HEADERS_PLUGIN_NAME = "mtplx-session-headers.js"
+OPENCODE_SESSION_HEADERS_PACKAGE_NAME = "mtplx-session-headers"
 OPENCODE_DESKTOP_SETTINGS_STORE_NAME = "default.dat"
 OPENCODE_DESKTOP_SETTINGS_KEY = "settings.v3"
 OPENCODE_DESKTOP_GLOBAL_STORE_NAME = "opencode.global.dat"
-OPENCODE_SESSION_HEADERS_PLUGIN_SOURCE = """const mtplxProviderID = (input) =>
+OPENCODE_SESSION_HEADERS_PLUGIN_SOURCE = (
+    """const mtplxProviderID = (input) =>
   input?.model?.providerID || input?.provider?.id;
 
 const mtplxInjectedOutputCap = __MTPLX_INJECTED_OUTPUT_CAP__;
+const mtplxInjectedQwenTemperature = __MTPLX_INJECTED_QWEN_TEMPERATURE__;
+const mtplxInjectedQwenTopP = __MTPLX_INJECTED_QWEN_TOP_P__;
 
 export const MTPLXSessionHeaders = async () => ({
   "chat.headers": async (input, output) => {
@@ -44,21 +95,62 @@ export const MTPLXSessionHeaders = async () => ({
     if (input?.sessionID) {
       output.headers["x-mtplx-session-id"] = String(input.sessionID);
     }
+    if (input?.message?.id) {
+      output.headers["x-mtplx-client-turn-id"] = String(input.message.id);
+    }
   },
   "chat.params": async (input, output) => {
     const providerID = mtplxProviderID(input);
     if (providerID && providerID !== "mtplx") return;
-    // OpenCode injects a 32k output ceiling even when the configured model
-    // advertises a larger native context. Strip only that injected default so
-    // MTPLX owns the uncapped generation contract; an explicit user cap (any
-    // other value) passes through untouched.
+    // OpenCode injects maxOutputTokens = min(limit.output, 32000) on every
+    // request even when the configured model advertises a larger native
+    // context. Strip exactly that injected default so MTPLX owns the
+    // uncapped generation contract; an explicit client cap (any other
+    // value) passes through untouched.
     if (output.maxOutputTokens === mtplxInjectedOutputCap) {
       output.maxOutputTokens = undefined;
+    }
+    // OpenCode <= 1.18.20 (Desktop 1.18.18 included) injects a qwen-keyed
+    // sampler (temperature 0.55, topP 1) for any model id containing
+    // "qwen"; 1.18.21 removed the rule. Strip exactly that injected pair so
+    // the MTPLX server's family-native sampler applies; any other value is
+    // a deliberate client choice and passes through untouched.
+    const modelID = String(input?.model?.id ?? input?.model?.modelID ?? "").toLowerCase();
+    if (modelID.includes("qwen")) {
+      if (output.temperature === mtplxInjectedQwenTemperature) {
+        output.temperature = undefined;
+      }
+      if (output.topP === mtplxInjectedQwenTopP) {
+        output.topP = undefined;
+      }
     }
   }
 });
 export default MTPLXSessionHeaders;
-""".replace("__MTPLX_INJECTED_OUTPUT_CAP__", str(OPENCODE_INJECTED_OUTPUT_CAP))
+"""
+    .replace("__MTPLX_INJECTED_OUTPUT_CAP__", str(OPENCODE_INJECTED_OUTPUT_CAP))
+    .replace(
+        "__MTPLX_INJECTED_QWEN_TEMPERATURE__",
+        str(OPENCODE_INJECTED_QWEN_TEMPERATURE),
+    )
+    .replace("__MTPLX_INJECTED_QWEN_TOP_P__", str(OPENCODE_INJECTED_QWEN_TOP_P))
+)
+
+
+OPENCODE_SESSION_HEADERS_V2_SOURCE = """// Older V1 imports index.js; modern V1 and V2 resolve this entrypoint.
+// No prompt, tool-schema or generation-option rewriting belongs here.
+import { MTPLXSessionHeaders } from "./index.js";
+export default {
+  id: "mtplx.session-headers",
+  server: MTPLXSessionHeaders,
+  async setup(ctx) {
+    await ctx.session.hook("model.request", (event) => {
+      event.headers["x-mtplx-client"] = "opencode";
+      event.headers["x-mtplx-session-id"] = String(event.sessionID);
+    }, { providerID: "mtplx" });
+  }
+};
+"""
 
 
 def opencode_config_path(path: str | Path | None = None) -> Path:
@@ -77,9 +169,12 @@ def opencode_config_path(path: str | Path | None = None) -> Path:
 
 
 def opencode_session_headers_plugin_path(path: str | Path | None = None) -> Path:
-    """Return the MTPLX-owned OpenCode plugin path next to opencode.json."""
+    """Return the managed package, discoverable by V2 and configured for V1."""
 
-    return opencode_config_path(path).parent / OPENCODE_SESSION_HEADERS_PLUGIN_NAME
+    return (
+        opencode_config_path(path).parent / "plugins"
+        / OPENCODE_SESSION_HEADERS_PACKAGE_NAME
+    )
 
 
 def opencode_desktop_settings_store_path(path: str | Path | None = None) -> Path:
@@ -176,6 +271,33 @@ def launch_opencode_app() -> dict[str, Any]:
     }
 
 
+def _opencode_effort_variants(
+    effort_levels: Sequence[str],
+) -> dict[str, dict[str, Any]]:
+    """Mirror the family effort dial into OpenCode's variant picker.
+
+    Disable the built-in tiers the family contract does not define, and write
+    an EXPLICIT variant for every tier it does. The earlier form declared a
+    family tier only when it was outside OPENAI_EFFORTS, trusting OpenCode to
+    surface the rest — but Desktop 1.18.21's picker does not offer its full
+    built-in list for a custom openai-compatible provider (observed live:
+    xhigh missing for the Flash-Next dial while low/medium rendered). An
+    explicit `{"reasoningEffort": tier}` variant always renders and merges
+    over any same-named built-in, so declaring every tier is correct on both
+    behaviors.
+    """
+
+    allowed = {str(level) for level in effort_levels}
+    variants: dict[str, dict[str, Any]] = {
+        effort: {"disabled": True}
+        for effort in OPENCODE_OPENAI_COMPATIBLE_DEFAULT_EFFORTS
+        if effort not in allowed
+    }
+    for level in effort_levels:
+        variants[str(level)] = {"reasoningEffort": str(level)}
+    return variants
+
+
 def build_opencode_provider_config(
     *,
     base_url: str,
@@ -189,16 +311,33 @@ def build_opencode_provider_config(
     temperature: float = 0.6,
     top_p: float = 0.95,
     top_k: int | None = None,
+    reasoning_effort: str | None = None,
+    reasoning_effort_levels: Sequence[str] | None = None,
+    vision: bool = False,
 ) -> dict[str, Any]:
     """Build the OpenCode provider/config fragment MTPLX owns.
 
     OpenCode's `limit` object is model metadata, not a server-side generation
     cap. We intentionally do not write hidden maxTokens/maxOutput caps.
+
+    ``reasoning``/``temperature`` are declared capable so OpenCode round-trips
+    assistant reasoning_content (preserve_thinking) and transmits explicit
+    client-side choices; with nothing chosen, OpenCode 1.18.21 sends no
+    sampler for MTPLX model ids and the server's family defaults (the app's
+    source of truth) apply. ``reasoning_effort`` is the app's current dial and
+    rides per-model ``options.reasoningEffort`` (@ai-sdk/openai-compatible
+    maps it to the wire's ``reasoning_effort``); an effort variant picked
+    inside OpenCode merges after model options and wins for that request.
+    The family sampler args are accepted for caller symmetry but deliberately
+    not written: @ai-sdk/openai-compatible 2.0.41 has no per-model sampler
+    transport (its provider-options schema is user/reasoningEffort/
+    textVerbosity/strictJsonSchema only), so writing them would be dead
+    config posing as policy.
     """
 
     context = int(context_window or OPENCODE_DEFAULT_CONTEXT_WINDOW)
-    output = int(output_limit if output_limit is not None else context)
-    _ = (enable_thinking, temperature, top_p, top_k)
+    output = opencode_output_limit(context, output_limit)
+    _ = (temperature, top_p, top_k)
     options: dict[str, Any] = {
         "baseURL": str(base_url).rstrip("/"),
         "timeout": False,
@@ -209,6 +348,27 @@ def build_opencode_provider_config(
     }
     if api_key:
         options["apiKey"] = str(api_key)
+    model: dict[str, Any] = {
+        "name": model_name or f"MTPLX {model_id}",
+        "reasoning": bool(enable_thinking),
+        "tool_call": True,
+        "temperature": True,
+        "limit": {
+            "context": context,
+            "output": output,
+        },
+        "modalities": {
+            "input": ["text", "image"] if vision else ["text"],
+            "output": ["text"],
+        },
+    }
+    if enable_thinking:
+        if reasoning_effort:
+            model["options"] = {"reasoningEffort": str(reasoning_effort)}
+        if reasoning_effort_levels is not None:
+            variants = _opencode_effort_variants(reasoning_effort_levels)
+            if variants:
+                model["variants"] = variants
     return {
         "provider": {
             OPENCODE_PROVIDER_ID: {
@@ -216,37 +376,13 @@ def build_opencode_provider_config(
                 "name": "MTPLX (local)",
                 "options": options,
                 "models": {
-                    str(model_id): {
-                        "name": model_name or f"MTPLX {model_id}",
-                        "reasoning": False,
-                        "tool_call": True,
-                        "temperature": False,
-                        "limit": {
-                            "context": context,
-                            "output": output,
-                        },
-                        "modalities": {
-                            "input": ["text"],
-                            "output": ["text"],
-                        },
-                    }
+                    str(model_id): model,
                 },
             }
         },
         "model": opencode_model_ref(str(model_id)),
         "small_model": opencode_model_ref(str(model_id)),
     }
-
-
-def _backup_invalid_config(path: Path) -> Path:
-    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
-    backup = path.with_name(f"{path.name}.invalid-{stamp}.bak")
-    counter = 1
-    while backup.exists():
-        backup = path.with_name(f"{path.name}.invalid-{stamp}-{counter}.bak")
-        counter += 1
-    path.replace(backup)
-    return backup
 
 
 def merge_opencode_config(
@@ -282,6 +418,21 @@ def merge_opencode_config(
             plugins = []
         else:
             plugins = [existing_plugins]
+        # Canonicalize: stale copies of the managed plugin registered under
+        # other paths would double-fire the hooks, so keep exactly one entry
+        # at the managed location.
+        plugins = [
+            item
+            for item in plugins
+            if not (
+                isinstance(item, str)
+                and item != plugin_path
+                and Path(item).name in {
+                    OPENCODE_SESSION_HEADERS_PLUGIN_NAME,
+                    OPENCODE_SESSION_HEADERS_PACKAGE_NAME,
+                }
+            )
+        ]
         if plugin_path not in [item for item in plugins if isinstance(item, str)]:
             plugins.append(plugin_path)
         payload["plugin"] = plugins
@@ -522,23 +673,35 @@ def _unique_backup(path: Path, reason: str) -> Path:
 def write_opencode_session_headers_plugin(
     path: str | Path | None = None,
 ) -> Path:
-    """Install the tiny MTPLX OpenCode plugin that carries session headers."""
+    """Install versioned entrypoints without dropping older V1 support.
+
+    V1 imports the package main (the original function API); V2's plugin
+    host resolves the server subpath first. Both use the same registration
+    path. See opencode.ai/v2/docs/build/plugins/migrate-v1 and @opencode/plugin
+    Host.resolve. No npm dependency or runtime version sniffing is needed.
+    """
 
     plugin_path = opencode_session_headers_plugin_path(path)
-    plugin_path.parent.mkdir(parents=True, exist_ok=True)
-    if (
-        not plugin_path.exists()
-        or plugin_path.read_text(encoding="utf-8")
-        != OPENCODE_SESSION_HEADERS_PLUGIN_SOURCE
-    ):
-        plugin_path.write_text(
-            OPENCODE_SESSION_HEADERS_PLUGIN_SOURCE,
-            encoding="utf-8",
-        )
-    try:
-        plugin_path.chmod(0o600)
-    except OSError:
-        pass
+    plugin_path.mkdir(parents=True, exist_ok=True)
+    files = {
+        "package.json": json.dumps({
+            "name": OPENCODE_SESSION_HEADERS_PACKAGE_NAME,
+            "private": True,
+            "type": "module",
+            "main": "./index.js",
+            "exports": {".": "./index.js", "./server": "./server.js"},
+        }, indent=2) + "\n",
+        "index.js": OPENCODE_SESSION_HEADERS_PLUGIN_SOURCE,
+        "server.js": OPENCODE_SESSION_HEADERS_V2_SOURCE,
+    }
+    for name, source in files.items():
+        target = plugin_path / name
+        if not target.exists() or target.read_text(encoding="utf-8") != source:
+            target.write_text(source, encoding="utf-8")
+        try:
+            target.chmod(0o600)
+        except OSError:
+            pass
     return plugin_path
 
 
@@ -563,13 +726,24 @@ def ensure_opencode_reasoning_summaries_visible(
     existing_data: str | None = None
 
     if store_path.exists():
+        # A store that cannot be read is OpenCode Desktop's to repair. It used
+        # to be moved aside and replaced with a store holding only this one
+        # setting, which threw away every other Desktop setting for a
+        # cosmetic tweak; now the tweak is skipped and the store left alone.
         try:
             existing_data = store_path.read_text(encoding="utf-8")
             parsed = json.loads(existing_data)
-            root = parsed if isinstance(parsed, dict) else {}
-        except (OSError, json.JSONDecodeError):
-            backup_path = _backup_invalid_config(store_path)
-            root = {}
+        except (OSError, json.JSONDecodeError) as exc:
+            return {
+                "supported": True,
+                "status": "unreadable_store",
+                "path": str(store_path),
+                "did_change": False,
+                "backup_path": None,
+                "setting": "settings.v3.general.showReasoningSummaries",
+                "error": str(exc),
+            }
+        root = parsed if isinstance(parsed, dict) else {}
 
     raw_settings = root.get(OPENCODE_DESKTOP_SETTINGS_KEY)
     settings: dict[str, Any] = {}
@@ -638,6 +812,9 @@ def write_opencode_config(
     temperature: float = 0.6,
     top_p: float = 0.95,
     top_k: int = 20,
+    reasoning_effort: str | None = None,
+    reasoning_effort_levels: Sequence[str] | None = None,
+    vision: bool = False,
 ) -> dict[str, Any]:
     """Write MTPLX into OpenCode config and return a handoff payload."""
 
@@ -645,12 +822,12 @@ def write_opencode_config(
     backup_path: Path | None = None
     existing: dict[str, Any] | None = None
     if config_path.exists():
-        try:
-            parsed = json.loads(config_path.read_text(encoding="utf-8"))
-            existing = parsed if isinstance(parsed, dict) else {}
-        except (OSError, json.JSONDecodeError):
-            backup_path = _backup_invalid_config(config_path)
-            existing = {}
+        # OpenCode reads this file as JSONC (comments, trailing commas), so
+        # MTPLX does too. A file that still does not parse is the user's to
+        # fix: InvalidConfigFile propagates and nothing here is moved or
+        # written, instead of the old move-aside that replaced their
+        # providers, agents and keybinds with an MTPLX-only config.
+        existing, _existing_text = load_config_file(config_path)
 
     fragment = build_opencode_provider_config(
         base_url=base_url,
@@ -664,6 +841,9 @@ def write_opencode_config(
         temperature=temperature,
         top_p=top_p,
         top_k=top_k,
+        reasoning_effort=reasoning_effort,
+        reasoning_effort_levels=reasoning_effort_levels,
+        vision=vision,
     )
     config_path.parent.mkdir(parents=True, exist_ok=True)
     session_headers_plugin_path = write_opencode_session_headers_plugin(config_path)
@@ -673,7 +853,15 @@ def write_opencode_config(
         provider_id=provider_id,
         session_headers_plugin_path=session_headers_plugin_path,
     )
-    config_path.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
+    # A file whose content already matches is left untouched, comments and
+    # formatting included. When a rewrite is needed the previous file is kept
+    # next to it and the copy's path is reported so every renderer can say so.
+    written = existing is None or merged != existing
+    if written:
+        if existing is not None:
+            backup_path = _unique_backup(config_path, "before-mtplx")
+            shutil.copy2(config_path, backup_path)
+        config_path.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
     try:
         config_path.chmod(0o600)
     except OSError:
@@ -687,11 +875,12 @@ def write_opencode_config(
         "model_id": model_id,
         "model_ref": opencode_model_ref(model_id, provider_id=provider_id),
         "context_window": int(context_window),
-        "output_limit": int(output_limit if output_limit is not None else context_window),
+        "output_limit": opencode_output_limit(context_window, output_limit),
         "chunk_timeout_ms": int(chunk_timeout_ms),
         "reasoning_field": "reasoning_content",
+        "reasoning_effort": reasoning_effort,
         "session_headers_plugin_path": str(session_headers_plugin_path),
         "reasoning_visibility": reasoning_visibility,
         "no_hidden_max_tokens": True,
-        "written": True,
+        "written": written,
     }

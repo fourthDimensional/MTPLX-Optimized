@@ -21,6 +21,11 @@ from .artifacts import (
     mtp_weights_present_on_disk,
     text_config,
 )
+from .backends.registry import (
+    ARCHITECTURE_DECLARED_MODULES,
+    ModelCompatibilityError,
+    engine_version_blocker,
+)
 from .mtp_adapters import (
     install_saved_mtp_lora_adapter,
     merge_installed_mtp_lora_adapters,
@@ -96,6 +101,7 @@ class MTPLXRuntime:
     deepseek_v4_attention_island_report: dict[str, Any] | None = None
     a3b_compiled_target_prefix_factory: A3BCompiledTargetPrefixFactory | None = None
     a3b_whole_moe_installed: bool = False
+    qwen4_relaxed_draft_ties: bool = False
     qwen_row_owned_router_report: dict[str, Any] = field(default_factory=dict)
     _a3b_whole_moe_request_preflights: dict[str, dict[str, Any]] = field(
         default_factory=dict,
@@ -237,6 +243,13 @@ class MTPLXRuntime:
         from .compiled_forward import CompiledARForward, compile_forward_enabled
 
         if not compile_forward_enabled() or not cache:
+            return None
+        from .dense_mrope import dense_mrope_state
+
+        if dense_mrope_state() is not None:
+            # An image request roped at grid positions: the compiled trunk
+            # carries a tensor offset and cannot slice the position table,
+            # so this request stays on the eager forward.
             return None
         # An unprimed cache (empty context / first token) has None KV leaves
         # that would crash the compiled graph. Only compile once the cache
@@ -432,7 +445,15 @@ class MTPLXRuntime:
 
     def make_cache(self):
         inner = getattr(self.model, "language_model", self.model)
-        cache = inner.make_cache()
+        if hasattr(inner, "make_cache"):
+            cache = inner.make_cache()
+        else:
+            # Plain mlx-lm models (the generic AR fallback lane) declare no
+            # custom cache; mlx-lm's own factory builds their default
+            # KVCache list, exactly as mlx_lm.generate would.
+            from mlx_lm.models.cache import make_prompt_cache
+
+            cache = make_prompt_cache(inner)
         from .cache_state import (
             configure_owned_recurrent_state_cache,
             configure_tail_owned_attention_kv_cache,
@@ -493,17 +514,11 @@ class LagunaARRuntime(MTPLXRuntime):
 
 
 # HF class name (as declared in config ``architectures``) -> mlx-lm module
-# implementing it. Extend this table only with verified schema-compatible
-# pairs; an architecture absent here keeps the fail-loud unknown-model_type
-# behavior.
-_ARCHITECTURE_DECLARED_MODULES = {
-    "Qwen3_5ForConditionalGeneration": "qwen3_5",
-    "Qwen3_5ForCausalLM": "qwen3_5",
-    "Qwen3_5TextForCausalLM": "qwen3_5",
-    "Qwen3_5MoeForConditionalGeneration": "qwen3_5_moe",
-    "Qwen3_5MoeForCausalLM": "qwen3_5_moe",
-    "Qwen3_5MoeTextForCausalLM": "qwen3_5_moe",
-}
+# implementing it. The table lives in backends.registry (single source of
+# truth shared with the compatibility verdicts); extend it only with
+# verified schema-compatible pairs — an architecture absent there keeps the
+# fail-loud unknown-model_type behavior.
+_ARCHITECTURE_DECLARED_MODULES = ARCHITECTURE_DECLARED_MODULES
 
 
 def _install_architectures_declared_module_alias(config: dict[str, Any]) -> bool:
@@ -559,6 +574,34 @@ def _install_architectures_declared_module_alias(config: dict[str, Any]) -> bool
     return False
 
 
+DERIVED_DENSE_KV_BYTES_ENV = "MTPLX_DENSE_KV_BYTES_PER_TOKEN_DERIVED"
+
+
+def _export_derived_model_geometry(config: dict[str, Any] | None) -> int | None:
+    """Publish the served model's dense KV bytes per token, from config.json.
+
+    ``generation._dense_decode_max_context`` has no runtime handle (env is
+    the plumbing in that module), and before this export nothing told it
+    the model's geometry: Flash-Next's dense-decode ceiling was budgeted
+    with the 27B's 65,536 bytes per token against a true 24,576. The value
+    is DERIVED (never typed) and the operator's own
+    MTPLX_DENSE_KV_BYTES_PER_TOKEN still wins. A config that does not
+    describe its attention clears the key, so a second load in one process
+    never inherits the previous model's geometry.
+    """
+
+    import os as _os
+
+    from .memory_plan import dense_kv_bytes_per_token_from_config
+
+    derived = dense_kv_bytes_per_token_from_config(config)
+    if derived and derived > 0:
+        _os.environ[DERIVED_DENSE_KV_BYTES_ENV] = str(int(derived))
+        return int(derived)
+    _os.environ.pop(DERIVED_DENSE_KV_BYTES_ENV, None)
+    return None
+
+
 def load(
     model_path: Path | str,
     *,
@@ -580,6 +623,9 @@ def load(
     never reduced.
     """
     path = Path(model_path)
+    engine_blocker = engine_version_blocker(_load_runtime_metadata(path))
+    if engine_blocker:
+        raise ModelCompatibilityError(engine_blocker)
     from .gemma4_pair import resolve_gemma4_pair_paths
 
     gemma4_pair = resolve_gemma4_pair_paths(path)
@@ -619,6 +665,7 @@ def load(
             return runtime
         path = Path(gemma4_pair["target_model"])
     config = load_config(path)
+    _export_derived_model_geometry(config)
     from .a3b_whole_moe import validate_a3b_whole_moe_load_options
 
     validate_a3b_whole_moe_load_options(
@@ -721,6 +768,10 @@ def load(
             inject_deepseek_v4_mtp_support,
             is_deepseek_v4_mtp_config,
         )
+        from .models.qwen4_exp import (
+            inject_qwen4_exp_mtp_support,
+            is_qwen4_exp_mtp_config,
+        )
         from .qwen3_5_mtp_patch import inject_qwen3_5_mtp_support
 
         if is_deepseek_v4_mtp_config(config):
@@ -741,6 +792,11 @@ def load(
             mtp_enabled = inject_step3p5_mtp_support(model, path, config, contract)
         elif is_hy_v3_mtp_config(config):
             mtp_enabled = inject_hy_v3_mtp_support(model, path, config, contract)
+        elif is_qwen4_exp_mtp_config(config):
+            # Flash-Next native draft head: attach_mtp builds it from the
+            # pack's self-describing mtp.safetensors sidecar and publishes
+            # the runtime surface on language_model.
+            mtp_enabled = inject_qwen4_exp_mtp_support(model, path, config, contract)
         elif is_qwen3_5_mtp_config(config):
             mtp_enabled = inject_qwen3_5_mtp_support(model, path, config, contract)
         elif is_deepseek_mtp_config(config):
@@ -779,6 +835,19 @@ def load(
 
         configure_split_full_attention(model)
         configure_native_mlp(model)
+        from .dense_mrope import configure_dense_mrope
+
+        # Dense Qwen3.5 / Qwen3.8 packs with a vision tower: image requests
+        # rope image tokens at their (t, h, w) grid positions. Runs after MTP
+        # injection so the draft head's attention is covered too. Text-only
+        # packs, other families and MTPLX_DENSE_MROPE=0 are left untouched.
+        dense_mrope_install = configure_dense_mrope(model, config)
+        if dense_mrope_install is not None:
+            # Not installed on a dense vision pack means every image request
+            # falls back to sequential positions (and is counted): say so.
+            (logger.info if dense_mrope_install.installed else logger.warning)(
+                "[dense-mrope] %s", dense_mrope_install
+            )
         from .lfm2_fast import is_lfm2_config, install_lfm2_fast
 
         # LFM2 (LiquidAI) dense hybrid: bit-exact decode fast-path that fuses
@@ -794,6 +863,15 @@ def load(
         if moe_pack_gate_up_enabled():
             pack_report = configure_moe_packed_projections(model)
             logger.info("[moe-pack] %s", pack_report)
+        # Must run after MTP injection and after load-coverage validation.
+        from .proj_fusion import (
+            configure_fused_projections,
+            fuse_projections_enabled,
+        )
+
+        if fuse_projections_enabled():
+            fuse_report = configure_fused_projections(model)
+            logger.info("[proj-fusion] %s", fuse_report)
         from .nax_verify import install_nax_qlinear_patch, nax_env_enabled
 
         if nax_env_enabled():
@@ -807,6 +885,14 @@ def load(
         if blocked_prefill_env_enabled():
             gdn_prefill_report = install_gdn_blocked_prefill_patch()
             logger.info("[gdn-blocked-prefill] %s", gdn_prefill_report)
+            if not gdn_prefill_report.get("installed"):
+                from .demotions import note as _note_demotion
+
+                _note_demotion(
+                    "gdn_blocked_prefill_not_engaged",
+                    "MTPLX_GDN_BLOCKED_PREFILL is on but the patch did not "
+                    f"install: {gdn_prefill_report.get('error') or 'unknown error'}",
+                )
         from .qwen_row_owned_router import (
             install_qwen_row_owned_routers,
             prepare_qwen_row_owned_routers,
@@ -946,6 +1032,78 @@ def load(
         a3b_whole_moe_installed=False,
         qwen_row_owned_router_report=router_report,
     )
+    if str((config or {}).get("model_type") or "").lower() in {
+        "qwen4_exp",
+        "qwen4_exp_text",
+    }:
+        relaxed_draft_ties = (
+            os.environ.get("MTPLX_QWEN4_RELAXED_DRAFT_TIES", "").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        if relaxed_draft_ties:
+            if not mtp_enabled:
+                raise RuntimeError("relaxed Qwen4 draft ties require native MTP")
+            if adapter_path is not None:
+                raise RuntimeError("relaxed Qwen4 draft ties do not accept adapters")
+            runtime.qwen4_relaxed_draft_ties = True
+            # Engagement receipt: the flag only swaps the cycle draft reader
+            # inside generate_mtpk, so the load log is where an A/B proves
+            # the relaxed-tie arm is the one serving.
+            logger.info(
+                "[qwen4-relaxed-draft-ties] installed: cycle draft reader will "
+                "use sparse_distribution_from_mlx_logits_relaxed_ties"
+            )
+        compiled_mtp_prepare = (
+            os.environ.get("MTPLX_QWEN4_COMPILED_MTP_PREPARE", "")
+            .strip()
+            .lower()
+            in {"1", "true", "yes", "on"}
+        )
+        if compiled_mtp_prepare:
+            if adapter_path is not None:
+                raise RuntimeError(
+                    "compiled Qwen4 MTP preparation requires the native draft head"
+                )
+            text_model = getattr(model, "language_model", model)
+            mtp_module = getattr(text_model, "mtp", None)
+            install_prepare = getattr(mtp_module, "install_compiled_prepare", None)
+            if install_prepare is None:
+                raise RuntimeError(
+                    "compiled Qwen4 MTP preparation is unavailable on this model"
+                )
+            runtime.qwen4_compiled_mtp_prepare_report = install_prepare()
+            logger.info(
+                "[qwen4-compiled-MTP-prepare] %s",
+                runtime.qwen4_compiled_mtp_prepare_report,
+            )
+        from .qwen4_fixed_verify import (
+            install_qwen4_fixed_verify_route,
+            qwen4_fixed_verify_enabled,
+        )
+
+        if qwen4_fixed_verify_enabled():
+            qwen4_verify_report = install_qwen4_fixed_verify_route(runtime)
+            runtime.qwen4_fixed_verify_report = qwen4_verify_report
+            logger.info("[qwen4-fixed-M4-verify] %s", qwen4_verify_report)
+        from .qwen4_m4_stage3 import (
+            install_qwen4_m4_stage3,
+            qwen4_m4_stage3_flags,
+        )
+
+        (
+            m4_stage3_enabled,
+            routed_reduce_enabled,
+            residual_tail_enabled,
+            routed_glu_enabled,
+        ) = qwen4_m4_stage3_flags()
+        if m4_stage3_enabled:
+            qwen4_m4_stage3_report = install_qwen4_m4_stage3(
+                runtime,
+                routed_down_reduce_enabled=routed_reduce_enabled,
+                routed_down_residual_tail_enabled=residual_tail_enabled,
+                routed_glu_enabled=routed_glu_enabled,
+            )
+            logger.info("[qwen4-M4-stage3] %s", qwen4_m4_stage3_report)
     if whole_moe_plan is not None:
         if compiled_target_factory is None:
             from .a3b_whole_moe import A3BWholeMoeConfigError
@@ -965,6 +1123,26 @@ def load(
     # The server prints this as its startup engagement receipt; logger.info
     # alone is invisible under `python -m mtplx.server.openai` (no handler).
     runtime.laguna_fused_report = fused_report
+    # Gate on the object that actually runs the layer loop, not the config
+    # string: dense Qwen3.8 loads as plain `qwen3_5`, and mtp_patch shadows
+    # the TextModel class with its own loop — but the layers stay stock
+    # `qwen3_5.DecoderLayer`, which is what the rung wrapper patches.
+    try:
+        from mlx_lm.models import qwen3_5 as _qwen3_5_module
+
+        _inner_text = getattr(
+            getattr(model, "language_model", model), "model", None
+        )
+        if isinstance(_inner_text, _qwen3_5_module.Qwen3_5TextModel):
+            from .packed_concats import install_qwen3_next_packed_concats
+            from .prefill_rungs import install_qwen3_5_prefill_rungs
+
+            # Env-gated (MTPLX_PREFILL_ASYNC_RUNGS); no-op without a stride.
+            install_qwen3_5_prefill_rungs()
+            # Env-gated (MTPLX_PACKED_PROJ_CONCATS); no-op unless enabled.
+            install_qwen3_next_packed_concats(model)
+    except ImportError:
+        pass
     return runtime
 
 
@@ -978,13 +1156,52 @@ def _is_laguna_s_2_1_mlx_4bit_config(config: dict[str, Any]) -> bool:
     return is_laguna_s_2_1_mlx_4bit_config(config)
 
 
+def _deepseek_v4_model_classes() -> tuple[type, type]:
+    from .models.deepseek_v4 import Model, ModelArgs
+
+    return Model, ModelArgs
+
+
+def _qwen4_exp_model_classes() -> tuple[type, type]:
+    from .models.qwen4_exp import Model, ModelArgs
+
+    return Model, ModelArgs
+
+
+def _prism_hadamard_qwen35_model_classes() -> tuple[type, type]:
+    from .models.prism_hadamard_qwen35 import Model, ModelArgs
+
+    return Model, ModelArgs
+
+
+# model_type -> loader of MTPLX-owned (Model, ModelArgs) classes for
+# architectures the pinned mlx-lm does not implement. A new in-tree
+# architecture (e.g. the Qwen3.8-Flash-Next backend) registers its loader
+# here AND its model_type in backends.registry._INTREE_MODEL_TYPES, keeping
+# the compatibility verdict and the loader in lockstep. Laguna stays a
+# geometry-gated special case below because its match is not model_type-keyed.
+_INTREE_MODEL_CLASS_LOADERS: dict[str, Callable[[], tuple[type, type]]] = {
+    "deepseek_v4": _deepseek_v4_model_classes,
+    "qwen4_exp": _qwen4_exp_model_classes,
+    # Text-config spelling of the same family: inspection prefers the nested
+    # text_config.model_type for multimodal checkpoints, and text-only
+    # re-exports carry it at top level. Same trunk, same classes.
+    "qwen4_exp_text": _qwen4_exp_model_classes,
+    # Prism ML's rotated ternary packs of the Qwen3.5-family trunk (Ternary
+    # Bonsai 2 27B). A stock loader would run them without the activation
+    # transform and return wrong output, so the model_type is owned here.
+    "prism_hadamard_qwen35": _prism_hadamard_qwen35_model_classes,
+}
+
+
 def _model_classes_for_config(config: dict[str, Any]) -> tuple[type, type] | None:
     """Return MTPLX-owned model classes for architectures missing in mlx-lm."""
 
-    if str(config.get("model_type") or "").lower() == "deepseek_v4":
-        from .models.deepseek_v4 import Model, ModelArgs
-
-        return Model, ModelArgs
+    loader = _INTREE_MODEL_CLASS_LOADERS.get(
+        str(config.get("model_type") or "").lower()
+    )
+    if loader is not None:
+        return loader()
     if not _is_laguna_s_2_1_mlx_4bit_config(config):
         return None
     from .models.laguna import Model, ModelArgs
@@ -1022,11 +1239,60 @@ def _load_base_model(path: Path, config: dict[str, Any]) -> tuple[Any, Any]:
                 "quantization_config": module_quantization,
             }
         model, _loaded_config = load_model(path, **load_kwargs)
+        # In-tree models with SSD-resident sidecars (e.g. the qwen4_exp
+        # n-gram table) finish wiring here — after weights, before serving.
+        post_load = getattr(model, "post_weight_load", None)
+        if callable(post_load):
+            post_load(path)
         return model, tokenizer
 
     from mlx_lm.utils import load as mlx_lm_load
 
-    return mlx_lm_load(str(_mtp_alias_load_path(path, config)))
+    model, tokenizer = mlx_lm_load(str(_mtp_alias_load_path(path, config)))
+    _refuse_double_shifted_trunk_norms(model, config)
+    return model, tokenizer
+
+
+def _refuse_double_shifted_trunk_norms(model: Any, config: dict[str, Any]) -> None:
+    """Fail loud on a +1.0 double-shifted trunk (#306), never serve it slow.
+
+    mlx-lm's qwen3.5-family sanitize keys the +1.0 delta restoration on the
+    bare PRESENCE of mtp.* keys in the shards, so an artifact that embeds an
+    already-absolute MTP head gets every trunk RMSNorm shifted a second time
+    — the model loads and generates, just badly (the #306 reports measured
+    0.9-6.7% acceptance and blamed the engine). Healthy absolute q-norm
+    means sit in the 1.74-1.83 fleet band; a double shift lands ~2.79. One
+    tensor mean decides it. Refusal with the cause beats silently serving a
+    corrupted trunk — the hide-nothing law.
+    """
+    family = str(config.get("model_type") or "").lower()
+    if family not in {"qwen3_5", "qwen3_next", "qwen3next"}:
+        return
+    weight = None
+    try:
+        layers = getattr(getattr(model, "model", model), "layers", None) or []
+        for layer in layers:
+            candidate = getattr(
+                getattr(layer, "self_attn", None), "q_norm", None
+            )
+            weight = getattr(candidate, "weight", None)
+            if weight is not None:
+                break
+        if weight is None or getattr(weight, "ndim", None) != 1:
+            return
+        mean = float(weight.mean().item())
+    except Exception:
+        return
+    if mean > 2.4:
+        raise ValueError(
+            "trunk RMSNorm weights read double-shifted "
+            f"(q_norm mean {mean:.2f}; healthy packs sit near 1.79): this "
+            "artifact embeds mtp.* keys in its shards with absolute gains, "
+            "and mlx-lm's presence-keyed sanitize added +1.0 to an "
+            "already-absolute trunk (issue #306). Rebuild the pack with the "
+            "MTP head as a standalone mtp.safetensors (mtplx forge does "
+            "this), or strip the embedded mtp.* tensors from the shards."
+        )
 
 
 # A chat_template that is nothing but a Jinja ``{% include %}`` redirect to a
@@ -1082,6 +1348,160 @@ def _repair_included_chat_template(tokenizer: Any, model_path: Path) -> None:
     tokenizer.chat_template = replacement
 
 
+# The pre-tokenizer regex every Qwen3-generation tokenizer.json ships (Qwen3.5,
+# 3.6, 3.8 and Flash-Next): letters and their combining marks stay in one word,
+# ``[\p{L}\p{M}]+``. transformers' ``Qwen2Tokenizer`` rebuilds the fast
+# backend from its own Qwen2-era regex (``\p{L}+``) and ignores the file, so
+# through AutoTokenizer a Devanagari, Thai or vowelled Arabic word is split at
+# every mark: Hindi 32 tokens instead of 20, Thai 17 instead of 9, Arabic 45
+# instead of 31 on the same sentence (measured on the shipped app runtime,
+# transformers 5.14.1, 2026-09-08). Latin, CJK and code are identical. The
+# model was trained on the file's regex, so the loader restores it.
+_QWEN3_PRETOKENIZER_SPLIT = (
+    "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}|"
+    " ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"
+)
+_LEGACY_QWEN2_PRETOKENIZER_SPLIT = (
+    "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}|"
+    " ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"
+)
+_QWEN3_PRETOKENIZER_FAMILY_PREFIXES = ("qwen3_5", "qwen3_next", "qwen4")
+
+
+def _pretokenizer_split_pattern(pre_tokenizer: Any) -> str | None:
+    """The Split regex inside a serialized ``tokenizers`` pre-tokenizer."""
+
+    if isinstance(pre_tokenizer, dict):
+        pattern = pre_tokenizer.get("pattern")
+        if isinstance(pattern, dict) and isinstance(pattern.get("Regex"), str):
+            return str(pattern["Regex"])
+        for value in pre_tokenizer.values():
+            found = _pretokenizer_split_pattern(value)
+            if found is not None:
+                return found
+    elif isinstance(pre_tokenizer, list):
+        for value in pre_tokenizer:
+            found = _pretokenizer_split_pattern(value)
+            if found is not None:
+                return found
+    return None
+
+
+def _pretokenizer_byte_level(pre_tokenizer: Any) -> dict[str, Any]:
+    """The ByteLevel settings inside a serialized pre-tokenizer (or defaults)."""
+
+    if isinstance(pre_tokenizer, dict):
+        if pre_tokenizer.get("type") == "ByteLevel":
+            return {
+                "add_prefix_space": bool(pre_tokenizer.get("add_prefix_space", False)),
+                "trim_offsets": bool(pre_tokenizer.get("trim_offsets", False)),
+                "use_regex": bool(pre_tokenizer.get("use_regex", False)),
+            }
+        for value in pre_tokenizer.values():
+            found = _pretokenizer_byte_level(value)
+            if found:
+                return found
+    elif isinstance(pre_tokenizer, list):
+        for value in pre_tokenizer:
+            found = _pretokenizer_byte_level(value)
+            if found:
+                return found
+    return {}
+
+
+def _fast_tokenizer_backend(tokenizer: Any) -> Any | None:
+    """The ``tokenizers.Tokenizer`` under an mlx-lm wrapper / HF fast tokenizer."""
+
+    for candidate in (tokenizer, getattr(tokenizer, "_tokenizer", None)):
+        if candidate is None:
+            continue
+        backend = getattr(candidate, "backend_tokenizer", None)
+        if backend is None:
+            inner = getattr(candidate, "_tokenizer", None)
+            if inner is not None and hasattr(inner, "pre_tokenizer"):
+                backend = inner
+        if backend is not None and hasattr(backend, "pre_tokenizer"):
+            return backend
+    return None
+
+
+def _model_family_for_tokenizer(config: dict[str, Any] | None) -> str:
+    config = config or {}
+    model_type = str(config.get("model_type") or "")
+    if not model_type:
+        model_type = str((config.get("text_config") or {}).get("model_type") or "")
+    return model_type
+
+
+def restore_qwen3_pretokenizer(
+    tokenizer: Any, model_path: Path, config: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """Make the loaded fast tokenizer split words the way the model was trained.
+
+    Two repairs, both only when they apply:
+    * the loaded backend's Split regex differs from the pack's tokenizer.json
+      (transformers rebuilt it from its class's own regex): install the file's;
+    * the file itself carries the Qwen2-era regex on a Qwen3-generation
+      family (the 27B packs were re-saved through ``Qwen2Tokenizer`` and
+      shipped that way): install the canonical Qwen3 regex.
+    Returns a receipt when something changed, else None. Never raises.
+    """
+
+    try:
+        backend = _fast_tokenizer_backend(tokenizer)
+        if backend is None:
+            return None
+        tokenizer_json = Path(model_path) / "tokenizer.json"
+        if not tokenizer_json.exists():
+            return None
+        file_pre = json.loads(tokenizer_json.read_text(encoding="utf-8")).get("pre_tokenizer")
+        file_pattern = _pretokenizer_split_pattern(file_pre)
+        if file_pattern is None:
+            return None
+        loaded_pattern = _pretokenizer_split_pattern(
+            json.loads(bytes(backend.pre_tokenizer.__getstate__()).decode("utf-8"))
+        )
+        family = _model_family_for_tokenizer(config)
+        wanted = file_pattern
+        reason = "tokenizer.json"
+        if file_pattern == _LEGACY_QWEN2_PRETOKENIZER_SPLIT and family.startswith(
+            _QWEN3_PRETOKENIZER_FAMILY_PREFIXES
+        ):
+            wanted = _QWEN3_PRETOKENIZER_SPLIT
+            reason = f"{family} family (tokenizer.json carries the Qwen2 regex)"
+        if loaded_pattern == wanted:
+            return None
+        from tokenizers import Regex, pre_tokenizers
+
+        byte_level = _pretokenizer_byte_level(file_pre)
+        backend.pre_tokenizer = pre_tokenizers.Sequence(
+            [
+                pre_tokenizers.Split(Regex(wanted), behavior="isolated", invert=False),
+                pre_tokenizers.ByteLevel(
+                    add_prefix_space=byte_level.get("add_prefix_space", False),
+                    trim_offsets=byte_level.get("trim_offsets", False),
+                    use_regex=byte_level.get("use_regex", False),
+                ),
+            ]
+        )
+        receipt = {
+            "source": reason,
+            "combining_marks_kept": "\\p{M}" in wanted,
+            "was": "qwen2" if loaded_pattern == _LEGACY_QWEN2_PRETOKENIZER_SPLIT else "other",
+        }
+        logger.warning(
+            "[tokenizer] restored the pre-tokenizer regex from %s: the loaded "
+            "tokenizer split combining marks off their letters (Devanagari, "
+            "Thai, vowelled Arabic tokenized 25-90%% longer than the model was "
+            "trained on)",
+            reason,
+        )
+        return receipt
+    except Exception as exc:  # noqa: BLE001 - a repair must never block a load
+        logger.warning("[tokenizer] pre-tokenizer repair skipped: %s", exc)
+        return None
+
+
 def _load_tokenizer_resilient(model_path: Path, config: dict[str, Any]) -> Any:
     from mlx_lm.utils import load_tokenizer
 
@@ -1094,6 +1514,7 @@ def _load_tokenizer_resilient(model_path: Path, config: dict[str, Any]) -> Any:
         )
     else:
         _repair_included_chat_template(tokenizer, model_path)
+        restore_qwen3_pretokenizer(tokenizer, model_path, config)
         return tokenizer
 
     from mlx_lm.tokenizer_utils import TokenizerWrapper
@@ -1130,11 +1551,13 @@ def _load_tokenizer_resilient(model_path: Path, config: dict[str, Any]) -> Any:
         eos_ids = list(eos)
     else:
         eos_ids = None
-    return TokenizerWrapper(
+    wrapped = TokenizerWrapper(
         hf_tokenizer,
         eos_token_ids=eos_ids,
         chat_template=None,
     )
+    restore_qwen3_pretokenizer(wrapped, model_path, config)
+    return wrapped
 
 
 def _mtp_alias_load_path(path: Path, config: dict[str, Any] | None) -> Path:

@@ -7,6 +7,13 @@ from typing import Any
 
 import mlx.core as mx
 
+from .attention_math import attention_gate
+from .rope_origin import (
+    cache_owns_rotary_origin,
+    note_unowned_rotary_origin,
+    rope_offset_of,
+)
+
 
 def _env_enabled(name: str, *, default: bool = False) -> bool:
     raw = os.environ.get(name)
@@ -35,6 +42,28 @@ def _count_gqa_packed_route_bail(reason: str) -> None:
     )
 
 
+#: The positive receipt next to the bail counts above (issue #506): how often
+#: the packed route ACCEPTED a verify window, keyed ``q<rows>_cap<bucket>``.
+#: Read both the same way. They are cumulative since boot, and they tick in
+#: Python, so inside the compiled verifier they count graph TRACES, not calls:
+#: one trace per (window, capacity bucket), and the compiled graph then runs
+#: the kernel on every call without coming back here. Warm-up traces small
+#: capacities, so ``capacity_below_threshold`` on a fresh daemon is warm-up,
+#: not the first request. Above the compiled-verify context fence the verifier
+#: runs eagerly and both counters count calls.
+gqa_packed_route_engaged_counts: dict[str, int] = {}
+
+
+def _count_gqa_packed_route_engaged(q_len: int, capacity: int) -> None:
+    # An eager cache grows 256 rows at a time; a power-of-two bucket keeps the
+    # key set small over a long session.
+    bucket = 1 << max(0, int(capacity).bit_length() - 1)
+    key = f"q{int(q_len)}_cap{bucket}"
+    gqa_packed_route_engaged_counts[key] = (
+        gqa_packed_route_engaged_counts.get(key, 0) + 1
+    )
+
+
 def _env_index_set(name: str) -> set[int]:
     raw = os.environ.get(name, "")
     out: set[int] = set()
@@ -48,6 +77,18 @@ def _env_index_set(name: str) -> set[int]:
 
 def _cache_offset_value(cache: Any) -> int | mx.array:
     return getattr(cache, "offset", 0) if cache is not None else 0
+
+
+def _cache_rope_offset(cache: Any) -> int | mx.array:
+    """Where the rope rotates the next row: the cache's own rotary origin.
+
+    A stock cache has none, so this is its host offset. A tensor-offset
+    cache of the compiled routes owns one (``rope_origin.RotaryOrigin``): the
+    plain offset array for a text request and ``offset + rope_delta`` for an
+    image request, so the traced graph never reads the request context.
+    """
+
+    return rope_offset_of(cache) if cache is not None else 0
 
 
 def _cache_offset_static_int(cache: Any) -> int | None:
@@ -162,7 +203,16 @@ def _install_split_attention_hook(attn: Any) -> bool:
         mask: mx.array | None = None,
         cache: Any | None = None,
     ) -> mx.array:
-        if not getattr(self, "_mtplx_split_full_attention_enabled", False):
+        if not getattr(
+            self, "_mtplx_split_full_attention_enabled", False
+        ) and not cache_owns_rotary_origin(cache):
+            # No MTPLX attention route asked for, and the cache has no rotary
+            # origin of its own: the stock forward, untouched. A cache that
+            # owns one (an image request on a compiled route) rotates at it
+            # below; the body under it is the stock forward's, row for row.
+            # The canary first: a tensor-offset cache that SHOULD have owned
+            # one is counted here, before the stock forward ropes it plainly.
+            note_unowned_rotary_origin(cache)
             return original_call(self, x, mask=mask, cache=cache)
         if not _attention_has_gated_q_proj(self):
             return original_call(self, x, mask=mask, cache=cache)
@@ -191,7 +241,6 @@ def _install_split_attention_hook(attn: Any) -> bool:
             3,
         )
 
-        cached_prefix_offset = _cache_offset_value(cache)
         cached_prefix_len = _cache_offset_static_int(cache)
         blockwise_threshold = int(
             getattr(self, "_mtplx_blockwise_full_attention_threshold", 1024)
@@ -219,8 +268,9 @@ def _install_split_attention_hook(attn: Any) -> bool:
             and can_slice_mask
         )
         if cache is not None:
-            queries = self.rope(queries, offset=cached_prefix_offset)
-            keys = self.rope(keys, offset=cached_prefix_offset)
+            rope_offset = _cache_rope_offset(cache)
+            queries = self.rope(queries, offset=rope_offset)
+            keys = self.rope(keys, offset=rope_offset)
             if blockwise_enabled or vllm_metal_paged_enabled:
                 cache.update_without_fetch(keys, values)
             else:
@@ -258,12 +308,18 @@ def _install_split_attention_hook(attn: Any) -> bool:
             from .kernel_selfcheck import lane_disabled
 
             gqa_packed_enabled = not lane_disabled("gqa_packed_sdpa")
+        # MTPLX_GQA_PACKED_WIDE (2026-08-25 flat-decode): route q_len 5-16
+        # to the query-group kernel instead of the second-bank path the QL
+        # sweep measured as the depth cliff. Off = shipping behavior.
+        gqa_packed_wide = _env_enabled("MTPLX_GQA_PACKED_WIDE")
         should_use_gqa_packed = (
             gqa_packed_enabled
             and cache is not None
             and not blockwise_enabled
             and not vllm_metal_paged_enabled
-            and 2 <= int(queries.shape[2]) <= 4
+            # 8 rows since 2026-07-21 (second float4 bank): depth 4's
+            # verify window is q_len 5; QL <= 4 compiles identically.
+            and 2 <= int(queries.shape[2]) <= (16 if gqa_packed_wide else 8)
             and can_slice_mask
             and getattr(cache, "keys", None) is not None
             and getattr(cache, "values", None) is not None
@@ -284,7 +340,7 @@ def _install_split_attention_hook(attn: Any) -> bool:
             and cache is not None
             and not blockwise_enabled
             and not vllm_metal_paged_enabled
-            and 2 <= int(queries.shape[2]) <= 4
+            and 2 <= int(queries.shape[2]) <= 8
         ):
             # F23b: enabled verify-shaped dense-cache window that the packed
             # route declined — record why (bail path only).
@@ -305,6 +361,36 @@ def _install_split_attention_hook(attn: Any) -> bool:
             and hasattr(cache, "paged_attention")
             and can_slice_mask
         )
+        if _env_enabled("MTPLX_ROUTE_DEBUG"):
+            # One line per layer for the first 2 decode-shaped calls: which
+            # branch the ladder takes and why — the 147.4k lane went dark
+            # because every fast branch declined SILENTLY (2026-08-26).
+            dbg_count = int(getattr(self, "_mtplx_route_debug_calls", 0))
+            if dbg_count < 8 and int(queries.shape[2]) <= 16:
+                self._mtplx_route_debug_calls = dbg_count + 1
+                import sys as _sys
+
+                print(
+                    "mtplx_route_debug "
+                    f"layer={getattr(self, '_mtplx_full_attention_index', -1)} "
+                    f"q_len={int(queries.shape[2])} "
+                    f"cache={type(cache).__name__} "
+                    f"blockwise={blockwise_enabled} "
+                    f"vllm_flag={bool(getattr(self, '_mtplx_vllm_metal_paged_enabled', False))} "
+                    f"vllm_enabled={vllm_metal_paged_enabled} "
+                    f"vllm_should={should_use_vllm_metal_paged} "
+                    f"packed_enabled={gqa_packed_enabled} "
+                    f"packed_should={should_use_gqa_packed} "
+                    f"has_uwf={hasattr(cache, 'update_without_fetch')} "
+                    f"has_pa={hasattr(cache, 'paged_attention')} "
+                    f"keys_none={getattr(cache, 'keys', None) is None} "
+                    f"cap={0 if getattr(cache, 'keys', None) is None else int(cache.keys.shape[2])} "
+                    f"mask={type(mask).__name__} "
+                    f"can_slice={can_slice_mask} "
+                    f"twopass={should_use_2pass}",
+                    file=_sys.stderr,
+                    flush=True,
+                )
         should_split = (
             cache is not None
             and getattr(self, "_mtplx_split_full_attention_explicit_enabled", False)
@@ -348,18 +434,110 @@ def _install_split_attention_hook(attn: Any) -> bool:
                     mask=mask,
                 )
         elif should_use_gqa_packed:
-            from .kernels.sdpa_gqa_packed import sdpa_gqa_packed_tail
-
-            output = sdpa_gqa_packed_tail(
-                queries=queries,
-                keys=cache.keys,
-                values=cache.values,
-                offset=cache.offset,
-                scale=self.scale,
+            from .kernels.sdpa_gqa_packed import (
+                sdpa_gqa_packed_tail,
+                sdpa_gqa_packed_tail_grouped,
             )
+
+            output = None
+            # MTPLX_NAX_FLASH_ROUTE (2026-09-01 hyper K2): TensorOps
+            # flash-decoding kernel (in-threadgroup key split, no V staging)
+            # for every packed-eligible window. Walk bench 72.7k QL4:
+            # 1.08 ms/layer vs packed 1.42 (-24%) at half the power. Bails
+            # fall through to the scalar routes unchanged.
+            if _env_enabled("MTPLX_NAX_FLASH_ROUTE") and int(queries.shape[2]) >= 2:
+                from .kernels.sdpa_nax_flash import sdpa_nax_flash
+                from .kernels.sdpa_nax_flash_dsplit import sdpa_nax_flash_dsplit
+
+                # Variant B (head-dim split, 64 accumulators/thread, no spills) owns the
+                # M<=32 windows (QL<=5 at GQA 6): 0.917 vs 1.015 ms/layer at 72.7k, 0.257 vs
+                # 0.306 at 16k. Variant A covers the wider windows (QL 6-10). Both bail to
+                # the scalar routes on any contract miss.
+                if not lane_disabled("nax_flash_dsplit_sdpa"):
+                    output = sdpa_nax_flash_dsplit(
+                        queries=queries,
+                        keys=cache.keys,
+                        values=cache.values,
+                        offset=cache.offset,
+                        scale=self.scale,
+                    )
+                if output is None and not lane_disabled("nax_flash_sdpa"):
+                    output = sdpa_nax_flash(
+                        queries=queries,
+                        keys=cache.keys,
+                        values=cache.values,
+                        offset=cache.offset,
+                        scale=self.scale,
+                    )
+                if output is not None:
+                    self._mtplx_nax_flash_calls = (
+                        int(getattr(self, "_mtplx_nax_flash_calls", 0)) + 1
+                    )
+                    if _env_enabled("MTPLX_GQA_PACKED_SDPA_TRACE") and (
+                        self._mtplx_nax_flash_calls <= 2
+                    ):
+                        import sys as _sys
+
+                        print(
+                            "mtplx_nax_flash_route engaged "
+                            f"layer={getattr(self, '_mtplx_full_attention_index', -1)} "
+                            f"q_len={int(queries.shape[2])} "
+                            f"capacity={int(cache.keys.shape[2])}",
+                            file=_sys.stderr,
+                            flush=True,
+                        )
+            if output is not None:
+                pass
+            # MTPLX_NAX_TILE_ROUTE (2026-08-26 hyper): TensorOps wide-M tile
+            # kernel for q_len >= 6 — the M-curve regime where the scalar
+            # kernels pay (Battery A + spot receipts: QL9 +34%/+45% at
+            # 71k/128k). Bails fall through to the scalar routes unchanged.
+            elif (
+                _env_enabled("MTPLX_NAX_TILE_ROUTE")
+                and int(queries.shape[2]) >= 6
+                and not lane_disabled("nax_tile_sdpa")
+            ):
+                from .kernels.sdpa_nax_tile import sdpa_nax_tile
+
+                output = sdpa_nax_tile(
+                    queries=queries,
+                    keys=cache.keys,
+                    values=cache.values,
+                    offset=cache.offset,
+                    scale=self.scale,
+                )
+                if output is not None:
+                    self._mtplx_nax_tile_calls = (
+                        int(getattr(self, "_mtplx_nax_tile_calls", 0)) + 1
+                    )
+            if output is not None:
+                pass
+            # Grouped wins past the second-bank register cliff: 2026-08-25
+            # three-way sweep at 71k — bank2 ahead at QL5-6; grouped ahead
+            # from QL7 (QL8 68.6 vs stock 83.7; QL9 with the mixed 4+5 v3
+            # tail 61.1 vs stock 83.6, -27%).
+            elif gqa_packed_wide and int(queries.shape[2]) >= 7:
+                output = sdpa_gqa_packed_tail_grouped(
+                    queries=queries,
+                    keys=cache.keys,
+                    values=cache.values,
+                    offset=cache.offset,
+                    scale=self.scale,
+                )
+            else:
+                output = sdpa_gqa_packed_tail(
+                    queries=queries,
+                    keys=cache.keys,
+                    values=cache.values,
+                    offset=cache.offset,
+                    scale=self.scale,
+                )
             if output is not None:
                 self._mtplx_gqa_packed_sdpa_calls = (
                     int(getattr(self, "_mtplx_gqa_packed_sdpa_calls", 0)) + 1
+                )
+                _count_gqa_packed_route_engaged(
+                    int(queries.shape[2]), int(cache.keys.shape[2])
                 )
                 if _env_enabled("MTPLX_GQA_PACKED_SDPA_TRACE") and (
                     self._mtplx_gqa_packed_sdpa_calls <= 2
@@ -446,7 +624,7 @@ def _install_split_attention_hook(attn: Any) -> bool:
                 mask=mask,
             )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return self.o_proj(output * mx.sigmoid(gate))
+        return self.o_proj(attention_gate(output, gate))
 
     cls.__call__ = split_call
     cls._mtplx_split_full_attention_installed = True
@@ -460,8 +638,15 @@ def _full_attention_layers(model: Any):
         if getattr(layer, "is_linear", False):
             continue
         attn = getattr(layer, "self_attn", None)
-        if attn is not None:
-            yield attn
+        if attn is None:
+            continue
+        # Modules whose attention semantics are not plain dense SDPA (e.g.
+        # the qwen4_exp QSA indexer mask) opt out class-side; hooking them
+        # would replace their __call__ with a rewrite that drops those
+        # semantics.
+        if getattr(attn, "_mtplx_generic_sdpa_rewrites_unsupported", False):
+            continue
+        yield attn
 
 
 def configure_split_full_attention(

@@ -1096,7 +1096,10 @@ def test_glm4_moe_mtp_with_family_layer_weights_is_runnable_without_contract(tmp
     assert result.compatibility["runtime_compatibility"] == "native-family-gated"
 
 
-def test_glm4_moe_mtp_with_unrelated_model_file_still_needs_contract(tmp_path):
+def test_glm4_moe_mtp_with_unrelated_model_file_serves_ar_mtp_off(tmp_path):
+    # 2026-08-26 (founder): an MTP head this build cannot attach is
+    # "MTP unavailable", never a refusal — the constructable trunk serves
+    # autoregressive with mtp_off.
     (tmp_path / "config.json").write_text(
         json.dumps(
             {
@@ -1113,8 +1116,12 @@ def test_glm4_moe_mtp_with_unrelated_model_file_still_needs_contract(tmp_path):
     result = inspect_model(tmp_path)
 
     assert result.compatibility["tier"] == "architecture-compatible-but-unverified"
-    assert result.compatibility["can_run"] is False
-    assert result.compatibility["runtime_compatibility"] == "needs-contract"
+    assert result.compatibility["can_run"] is True
+    assert (
+        result.compatibility["runtime_compatibility"]
+        == "native-ar-only-mtp-unsupported"
+    )
+    assert "MTP unavailable" in result.compatibility["message"]
 
 
 def test_glm4_moe_mtp_sidecar_layer_keys_are_family_runnable(tmp_path):
@@ -1263,7 +1270,9 @@ def test_mimo_mtp_with_family_layer_weights_is_runnable_without_contract(tmp_pat
     assert result.compatibility["runtime_compatibility"] == "native-family-gated"
 
 
-def test_mimo_mtp_with_unrelated_model_file_still_needs_contract(tmp_path):
+def test_mimo_mtp_with_unrelated_model_file_serves_ar_mtp_off(tmp_path):
+    # Same 2026-08-26 doctrine as the glm4_moe case above: MTP unavailable
+    # degrades to AR, it does not block a constructable trunk.
     (tmp_path / "config.json").write_text(
         json.dumps(
             {
@@ -1280,8 +1289,12 @@ def test_mimo_mtp_with_unrelated_model_file_still_needs_contract(tmp_path):
     result = inspect_model(tmp_path)
 
     assert result.compatibility["tier"] == "architecture-compatible-but-unverified"
-    assert result.compatibility["can_run"] is False
-    assert result.compatibility["runtime_compatibility"] == "needs-contract"
+    assert result.compatibility["can_run"] is True
+    assert (
+        result.compatibility["runtime_compatibility"]
+        == "native-ar-only-mtp-unsupported"
+    )
+    assert "MTP unavailable" in result.compatibility["message"]
 
 
 def test_minimax_m2_with_nextn_marker_is_recognized_backend_pending(tmp_path):
@@ -1410,6 +1423,48 @@ def test_nemotron_h_mtp_with_family_sidecar_is_runnable_without_contract(tmp_pat
 
     result = inspect_model(tmp_path)
 
+    assert result.compatibility["tier"] == "family-compatible-unverified"
+    assert result.compatibility["can_run"] is True
+    assert result.compatibility["runtime_compatibility"] == "native-family-gated"
+
+
+def test_nemotron_h_mtp_official_block_type_list_config_is_runnable(tmp_path):
+    """Official NVIDIA configs carry mtp_layers_block_type, not
+    mtp_hybrid_override_pattern; the derived pattern must match the runtime
+    routing gate or inspect and serve disagree (issue #341)."""
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["NemotronHForCausalLM"],
+                "model_type": "nemotron_h",
+                "num_nextn_predict_layers": 1,
+                "num_hidden_layers": 52,
+                # Backbone pattern (M/- chars) must not shadow the MTP stack.
+                "hybrid_override_pattern": "M-M-M*-M-M-M*-E",
+                "mtp_layers_block_type": ["attention", "moe"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    save_file(
+        {
+            "mtp.layers.0.enorm.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.0.hnorm.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.0.eh_proj.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.0.norm.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.0.mixer.q_proj.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.1.norm.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.1.mixer.gate.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.1.final_layernorm.weight": np.ones((1,), dtype=np.float32),
+        },
+        tmp_path / "mtp.safetensors",
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.mtp_pattern == "*E"
+    assert result.compatibility["arch_id"] == "nemotron-h-mtp"
     assert result.compatibility["tier"] == "family-compatible-unverified"
     assert result.compatibility["can_run"] is True
     assert result.compatibility["runtime_compatibility"] == "native-family-gated"
@@ -1884,8 +1939,11 @@ def test_laguna_config_only_directory_is_not_runnable(tmp_path):
 
     result = inspect_model(tmp_path)
 
-    assert result.compatibility["tier"] == "no-MTP"
     assert result.compatibility["can_run"] is False
+    assert (
+        result.compatibility["runtime_compatibility"]
+        == "pinned-artifact-integrity-failed"
+    )
 
 
 def test_complete_laguna_s_2_1_mlx_4bit_is_runnable_ar_only(
@@ -1918,8 +1976,11 @@ def test_laguna_shard_with_wrong_size_is_not_runnable(tmp_path, monkeypatch):
 
     result = inspect_model(tmp_path)
 
-    assert result.compatibility["tier"] == "no-MTP"
     assert result.compatibility["can_run"] is False
+    assert (
+        result.compatibility["runtime_compatibility"]
+        == "pinned-artifact-integrity-failed"
+    )
 
 
 def test_laguna_without_poolside_chat_template_is_not_runnable(
@@ -1934,8 +1995,11 @@ def test_laguna_without_poolside_chat_template_is_not_runnable(
 
     result = inspect_model(tmp_path)
 
-    assert result.compatibility["tier"] == "no-MTP"
     assert result.compatibility["can_run"] is False
+    assert (
+        result.compatibility["runtime_compatibility"]
+        == "pinned-artifact-integrity-failed"
+    )
 
 
 @pytest.mark.parametrize(
@@ -1957,8 +2021,11 @@ def test_laguna_with_mutated_pinned_sidecar_is_not_runnable(
 
     result = inspect_model(tmp_path)
 
-    assert result.compatibility["tier"] == "no-MTP"
     assert result.compatibility["can_run"] is False
+    assert (
+        result.compatibility["runtime_compatibility"]
+        == "pinned-artifact-integrity-failed"
+    )
 
 
 def test_non_4bit_laguna_is_not_admitted_by_target_only_gate(tmp_path):
@@ -1974,8 +2041,11 @@ def test_non_4bit_laguna_is_not_admitted_by_target_only_gate(tmp_path):
 
     result = inspect_model(tmp_path)
 
-    assert result.compatibility["tier"] == "no-MTP"
     assert result.compatibility["can_run"] is False
+    assert (
+        result.compatibility["runtime_compatibility"]
+        == "pinned-artifact-integrity-failed"
+    )
 
 
 def test_superseded_pipenetwork_laguna_is_not_admitted(tmp_path, monkeypatch):
@@ -1991,8 +2061,11 @@ def test_superseded_pipenetwork_laguna_is_not_admitted(tmp_path, monkeypatch):
 
     result = inspect_model(tmp_path)
 
-    assert result.compatibility["tier"] == "no-MTP"
     assert result.compatibility["can_run"] is False
+    assert (
+        result.compatibility["runtime_compatibility"]
+        == "pinned-artifact-integrity-failed"
+    )
 
 
 def test_laguna_config_with_remote_model_file_is_blocked(tmp_path):
@@ -2003,8 +2076,11 @@ def test_laguna_config_with_remote_model_file_is_blocked(tmp_path):
 
     result = inspect_model(tmp_path)
 
-    assert result.compatibility["tier"] == "no-MTP"
     assert result.compatibility["can_run"] is False
+    assert (
+        result.compatibility["runtime_compatibility"]
+        == "pinned-artifact-integrity-failed"
+    )
 
 
 def test_wrong_laguna_expert_geometry_is_not_admitted_by_target_only_gate(tmp_path):
@@ -2015,8 +2091,11 @@ def test_wrong_laguna_expert_geometry_is_not_admitted_by_target_only_gate(tmp_pa
 
     result = inspect_model(tmp_path)
 
-    assert result.compatibility["tier"] == "no-MTP"
     assert result.compatibility["can_run"] is False
+    assert (
+        result.compatibility["runtime_compatibility"]
+        == "pinned-artifact-integrity-failed"
+    )
 
 
 def test_wrong_laguna_attention_geometry_is_not_admitted_by_target_only_gate(
@@ -2031,8 +2110,11 @@ def test_wrong_laguna_attention_geometry_is_not_admitted_by_target_only_gate(
 
     result = inspect_model(tmp_path)
 
-    assert result.compatibility["tier"] == "no-MTP"
     assert result.compatibility["can_run"] is False
+    assert (
+        result.compatibility["runtime_compatibility"]
+        == "pinned-artifact-integrity-failed"
+    )
 
 
 def test_hf_qwen_mtp_without_runtime_contract_is_family_runnable(monkeypatch):
@@ -2236,6 +2318,50 @@ def test_hf_verified_contract_passes_metadata_gate(monkeypatch):
     assert result.runtime_contract_path == "/tmp/mtplx_runtime.json"
 
 
+@pytest.mark.parametrize("has_trunk", [True, False])
+def test_hf_qwen_declared_mtp_without_head_distinguishes_trunk(monkeypatch, has_trunk):
+    from mtplx import artifacts
+
+    # Nex-N2.5-mini declares one MTP layer but publishes only trunk/vision
+    # tensors. Remote shard evidence must not require a local download.
+    files = {"config.json", "model.safetensors.index.json"}
+    if has_trunk:
+        files.add("model-00001-of-00016.safetensors")
+    config = {
+        "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+        "model_type": "qwen3_5_moe",
+        "text_config": {
+            "model_type": "qwen3_5_moe_text",
+            "mtp_num_hidden_layers": 1,
+            "num_hidden_layers": 40,
+            "hidden_size": 2048,
+        },
+    }
+    monkeypatch.setattr(artifacts, "_hf_list_repo_files", lambda _: (files, None))
+
+    def fake_json(_repo_id, filename):
+        if filename == "config.json":
+            return config, "/tmp/config.json", None
+        assert filename == "mtplx_runtime.json"
+        return None, None, "404 Client Error: not found"
+
+    monkeypatch.setattr(artifacts, "_hf_download_json", fake_json)
+    monkeypatch.setattr(
+        artifacts,
+        "_hf_model_weight_keys",
+        lambda *_: (("model.language_model.layers.39.self_attn.q_proj.weight",), None),
+    )
+
+    result = inspect_model("nex-agi/Nex-N2.5-mini")
+
+    assert result.mtp.exists is False
+    assert result.compatibility["can_run"] is has_trunk
+    assert result.compatibility["mtp_supported"] == "no"
+    assert result.compatibility["runtime_compatibility"] == (
+        "native-ar-only-missing-mtp" if has_trunk else "missing-model-weights"
+    )
+
+
 def test_hf_llama_without_mtp_is_no_mtp(monkeypatch):
     from mtplx import artifacts
 
@@ -2300,7 +2426,11 @@ def test_gemma4_pair_bundle_root_is_runnable_from_remote_file_listing():
     assert verdict.runtime_compatibility == "assistant-pair-native"
 
 
-def test_gemma4_target_subfolder_alone_still_refuses():
+def test_gemma4_target_subfolder_alone_serves_ar_with_bundle_guidance():
+    # 2026-08-26 (founder): the target trunk loads through the bundled
+    # mlx-lm gemma4 module, so a lone target folder serves autoregressive
+    # (MTP unavailable) while the verdict still points at the assistant-pair
+    # bundle root for full speculative speed.
     from mtplx.artifacts import ModelInspection
     from mtplx.backends.registry import compatibility_for_inspection
 
@@ -2319,8 +2449,164 @@ def test_gemma4_target_subfolder_alone_still_refuses():
 
     verdict = compatibility_for_inspection(inspection)
 
-    assert verdict.can_run is False
-    assert verdict.runtime_compatibility == "incomplete-assistant-pair"
+    assert verdict.can_run is True
+    assert verdict.runtime_compatibility == "native-ar-only-mtp-unsupported"
+    assert "bundle root" in verdict.message
+
+
+def test_mlx_lm_loadable_family_without_mtp_serves_ar(tmp_path):
+    # 2026-08-26 (founder): any trunk this build can construct runs — MTP
+    # is an accelerator, never a load requirement. An mlx-lm-loadable
+    # family with no MTP head serves autoregressive at exit 0.
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["SmolLM3ForCausalLM"],
+                "model_type": "smollm3",
+            }
+        ),
+        encoding="utf-8",
+    )
+    save_file(
+        {"model.layers.0.self_attn.q_proj.weight": np.ones((1,), dtype=np.float32)},
+        tmp_path / "model.safetensors",
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["tier"] == "AR-only"
+    assert result.compatibility["can_run"] is True
+    assert result.compatibility["exit_code"] == 0
+    assert (
+        result.compatibility["runtime_compatibility"]
+        == "native-ar-only-missing-mtp"
+    )
+    assert "MTP unavailable" in result.compatibility["message"]
+
+
+def test_unknown_family_without_any_implementation_refuses_honestly(tmp_path):
+    # A model_type nothing in this build implements is a capability gap and
+    # says so — never "Model has no MTP head" (that message was a lie for
+    # models that ship one) and never a verification excuse.
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["TotallyNovelForCausalLM"],
+                "model_type": "totally_novel_arch",
+            }
+        ),
+        encoding="utf-8",
+    )
+    save_file(
+        {"model.layers.0.self_attn.q_proj.weight": np.ones((1,), dtype=np.float32)},
+        tmp_path / "model.safetensors",
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["can_run"] is False
+    assert "No MLX implementation" in result.compatibility["message"]
+    assert "capability gap" in result.compatibility["message"]
+    assert "MTP-equipped" not in result.compatibility["message"]
+
+
+def test_qwen4_flash_next_family_is_recognized(tmp_path):
+    # The real T-0 strings (config landed 2026-08-26 15:00 UTC) resolve to
+    # the qwen4-next catalog row even without MTP markers — recognition is
+    # not can_run, and a trunk-only checkpoint still belongs to the family.
+    # With the in-tree backend shipped, the trunk is constructable: AR-only.
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen4ExpForConditionalGeneration"],
+                "model_type": "qwen4_exp",
+            }
+        ),
+        encoding="utf-8",
+    )
+    save_file(
+        {"model.layers.0.self_attn.q_proj.weight": np.ones((1,), dtype=np.float32)},
+        tmp_path / "model.safetensors",
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["arch_id"] == "qwen4-next"
+    assert result.compatibility["recognized"] is True
+    assert result.compatibility["can_run"] is True
+    assert "autoregressive" in result.compatibility["message"]
+
+
+def test_qwen4_speculative_predrop_names_are_not_swallowed(tmp_path):
+    # #268 family-collision law: the speculative pre-drop names
+    # (qwen3_8_flash_next and friends) were purged from the catalog and must
+    # never be swallowed into the qwen4-next family — or any other.
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3_8FlashNextForConditionalGeneration"],
+                "model_type": "qwen3_8_flash_next",
+            }
+        ),
+        encoding="utf-8",
+    )
+    save_file(
+        {"model.layers.0.self_attn.q_proj.weight": np.ones((1,), dtype=np.float32)},
+        tmp_path / "model.safetensors",
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["arch_id"] is None
+    assert result.compatibility["tier"] == "incompatible-architecture"
+    assert result.compatibility["can_run"] is False
+
+
+def test_auto_map_is_ignored_when_trunk_is_constructable(tmp_path):
+    # MTPLX never executes repository code, so declared custom classes are
+    # irrelevant when this build ships its own implementation and a fast
+    # tokenizer is present — auto_map alone must not refuse the checkpoint.
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["LlamaForCausalLM"],
+                "model_type": "llama",
+                "auto_map": {"AutoModelForCausalLM": "modeling_x.CustomModel"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "tokenizer.json").write_text("{}", encoding="utf-8")
+    save_file(
+        {"model.layers.0.self_attn.q_proj.weight": np.ones((1,), dtype=np.float32)},
+        tmp_path / "model.safetensors",
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["can_run"] is True
+
+
+def test_auto_map_without_native_implementation_still_refuses(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["TotallyNovelForCausalLM"],
+                "model_type": "totally_novel_arch",
+                "auto_map": {"AutoModelForCausalLM": "modeling_x.CustomModel"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    save_file(
+        {"model.layers.0.self_attn.q_proj.weight": np.ones((1,), dtype=np.float32)},
+        tmp_path / "model.safetensors",
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["can_run"] is False
+    assert "auto_map" in result.compatibility["message"]
 
 
 def test_user_promoted_contract_runs_as_unverified_label(monkeypatch, tmp_path):
@@ -2391,7 +2677,7 @@ def test_pull_refreshes_when_remote_index_changed(monkeypatch, tmp_path):
         encoding="utf-8",
     )
 
-    def fake_download(repo_id, filename, revision=None):
+    def fake_download(repo_id, filename, revision=None, token=None):
         return str(fake_download.target)
 
     monkeypatch.setattr("huggingface_hub.hf_hub_download", fake_download)
@@ -2402,7 +2688,7 @@ def test_pull_refreshes_when_remote_index_changed(monkeypatch, tmp_path):
     fake_download.target = remote_changed
     assert hf_loader._local_matches_remote_index(local, "org/repo", None) is False
 
-    def broken_download(repo_id, filename, revision=None):
+    def broken_download(repo_id, filename, revision=None, token=None):
         raise RuntimeError("offline")
 
     monkeypatch.setattr("huggingface_hub.hf_hub_download", broken_download)
@@ -2660,3 +2946,282 @@ def test_remote_code_checkpoints_refuse_cleanly(tmp_path):
     assert result.compatibility["runtime_compatibility"] == "trust-remote-code-required"
     assert result.compatibility["can_run"] is False
     assert "trust_remote_code" in result.compatibility["message"]
+
+
+def test_public_model_id_alias_tables_agree():
+    """Every public model id must resolve, by id and by HF folder basename.
+
+    Three hand-maintained alias tables carry these pairs (mtplx/artifacts.py,
+    mtplx/model_catalog.py, mtplx/commands/public.py). They drifted once: the
+    Flash-Next rows were missing from artifacts.py, so the release notes' own
+    `mtplx pull mtplx-flash-next-bare-speed` died with "pull requires a Hugging
+    Face repo id or URL" and `serve --model mtplx-flash-next-bare-speed` raised
+    FileNotFoundError. Enumerating from mtplx.profiles (rather than listing the
+    ids here) means a newly added public id joins this test automatically.
+    """
+
+    from pathlib import Path as _Path
+
+    from mtplx import profiles
+    from mtplx.hf_loader import repo_id_from_model_ref
+
+    public_id_names = sorted(
+        name for name in dir(profiles) if name.endswith("_PUBLIC_MODEL_ID")
+    )
+    assert public_id_names, "no public model ids exported by mtplx.profiles"
+
+    checked = set()
+    for name in public_id_names:
+        hf_name = name.replace("_PUBLIC_MODEL_ID", "_HF_MODEL_ID")
+        assert hasattr(profiles, hf_name), f"{name} has no {hf_name} pair"
+        public_id = getattr(profiles, name)
+        hf_repo_id = getattr(profiles, hf_name)
+
+        assert (
+            repo_id_from_model_ref(public_id) == hf_repo_id
+        ), f"{name} ({public_id!r}) does not resolve to {hf_repo_id!r}"
+        basename = _Path(hf_repo_id).name
+        assert (
+            repo_id_from_model_ref(basename) == hf_repo_id
+        ), f"HF basename {basename!r} does not resolve to {hf_repo_id!r}"
+        checked.add(public_id)
+
+    # The two ids the 2.10.0 release notes tell users to pull by name.
+    assert {
+        "mtplx-flash-next-bare-speed",
+        "mtplx-flash-next-optimized-speed",
+    } <= checked
+
+
+# ---------------------------------------------------------------------------
+# download accounting: leftovers are reported, never counted, never "partial"
+
+
+def _write_bytes(path, count: int, fill: bytes = b"x") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(fill * count)
+
+
+def test_manifest_bytes_ignore_leftovers_and_stale_bytes_report_them(tmp_path):
+    from mtplx import hf_loader
+
+    dest = tmp_path / "model"
+    _write_bytes(dest / "config.json", 100)
+    _write_bytes(dest / "model-00001-of-00002.safetensors.incomplete", 40)
+    _write_bytes(dest / "model-00002-of-00002.safetensors.incomplete", 999)
+    _write_bytes(dest / ".cache" / "huggingface" / "download" / "abc.incomplete", 5000)
+    _write_bytes(dest / "model-00007-of-00039.safetensors.incomplete", 700)
+    manifest = [
+        hf_loader.RepoFile("config.json", 100),
+        hf_loader.RepoFile("model-00001-of-00002.safetensors", 60),
+        hf_loader.RepoFile("model-00002-of-00002.safetensors", 60),
+    ]
+
+    assert hf_loader.manifest_bytes_on_disk(dest, manifest) == 100 + 40 + 60
+    assert hf_loader.stale_transient_bytes(dest, manifest) == (5700, 2)
+    assert hf_loader.directory_size_bytes(dest) == 100 + 40 + 999 + 5000 + 700
+    assert hf_loader.stale_transient_bytes(tmp_path / "missing", manifest) == (0, 0)
+    assert hf_loader._model_bytes_without_transients(dest) == 100
+
+
+def test_cached_model_complete_ignores_stale_partials(tmp_path):
+    # Only a partial whose final file has not landed, of a file the weight
+    # index needs, is an interrupted transfer. Stray markers made a
+    # byte-complete folder "partial" forever: Retry re-fetched nothing and
+    # reached the same verdict.
+    import json as _json
+
+    from mtplx import hf_loader
+
+    model = tmp_path / "model"
+    _write_bytes(model / "config.json", 10)
+    (model / "model.safetensors.index.json").write_text(
+        _json.dumps(
+            {
+                "weight_map": {
+                    "a": "model-00001-of-00002.safetensors",
+                    "b": "model-00002-of-00002.safetensors",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    _write_bytes(model / "model-00001-of-00002.safetensors", 5)
+    _write_bytes(model / "model-00002-of-00002.safetensors", 5)
+    _write_bytes(model / "model-00002-of-00002.safetensors.incomplete", 3)
+    _write_bytes(model / "model-00001-of-00039.safetensors.incomplete", 3)
+    _write_bytes(model / ".cache" / "huggingface" / "download" / "x.incomplete", 3)
+    assert hf_loader.cached_model_is_complete(model)
+
+    (model / "model-00002-of-00002.safetensors").unlink()
+    assert not hf_loader.cached_model_is_complete(model)
+
+    single = tmp_path / "single"
+    _write_bytes(single / "config.json", 10)
+    _write_bytes(single / "model.safetensors", 50)
+    _write_bytes(single / "model-00001-of-00039.safetensors.incomplete", 3)
+    assert hf_loader.cached_model_is_complete(single)
+    (single / "model.safetensors").rename(single / "model.safetensors.incomplete")
+    assert not hf_loader.cached_model_is_complete(single)
+
+
+class _FakeSibling:
+    def __init__(self, rfilename: str, size: int):
+        self.rfilename = rfilename
+        self.size = size
+        self.blob_id = f"blob-{rfilename}"
+
+
+class _FakeModelInfo:
+    def __init__(self, siblings, sha: str = "abc123"):
+        self.siblings = siblings
+        self.sha = sha
+
+
+def _install_fake_hub(monkeypatch, files: dict[str, bytes]) -> None:
+    from mtplx import hf_loader
+
+    class _FakeApi:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def model_info(self, repo_id, revision=None, files_metadata=True, token=None):
+            return _FakeModelInfo([_FakeSibling(name, len(content)) for name, content in files.items()])
+
+    def fake_runtime():
+        return (
+            _FakeApi,
+            lambda repo_id, filename, revision=None: f"https://example.invalid/{filename}",
+            lambda: None,
+            lambda token=None: {},
+            lambda response: None,
+        )
+
+    def fake_stream(session, url, headers):
+        return _FakeHubResponse(headers, files[url.rsplit("/", 1)[1]])
+
+    monkeypatch.setattr(hf_loader, "_hub_runtime", fake_runtime)
+    monkeypatch.setattr(hf_loader, "_open_hub_stream", fake_stream)
+    monkeypatch.setattr(
+        hf_loader,
+        "_query_repo_snapshot",
+        lambda repo_id, revision=None: (
+            "abc123",
+            {name: {"size": len(content), "blob_id": f"blob-{name}"} for name, content in files.items()},
+        ),
+    )
+    monkeypatch.setattr(hf_loader, "hf_token_for_download", lambda: False)
+
+
+_TINY_REPO_FILES = {
+    "config.json": b'{"model_type": "toy"}',
+    "tokenizer.json": b"{}",
+    "model.safetensors": b"w" * 3000,
+}
+
+
+def test_pull_reports_leftovers_and_finishes_complete_despite_them(monkeypatch, tmp_path):
+    from mtplx import hf_loader
+
+    _install_fake_hub(monkeypatch, _TINY_REPO_FILES)
+    cache = tmp_path / "cache"
+    dest = cache / "org--tiny"
+    _write_bytes(dest / ".cache" / "huggingface" / "download" / "old.incomplete", 20_000)
+    _write_bytes(dest / "model-00001-of-00039.safetensors.incomplete", 8_000)
+    events: list[dict] = []
+
+    result = hf_loader.pull_model(
+        "org/tiny", cache_dir=cache, progress_callback=events.append, progress_interval_s=0.0
+    )
+
+    total = sum(len(content) for content in _TINY_REPO_FILES.values())
+    assert events[0]["event"] == "start"
+    assert events[0]["size_bytes"] == 0
+    assert events[0]["total_bytes"] == total
+    assert events[0]["stale_bytes"] == 28_000
+    assert events[0]["stale_files"] == 2
+    assert events[0]["disk_bytes"] == 28_000
+    progress = [event for event in events if event["event"] == "progress"]
+    assert progress
+    assert all(0 <= event["size_bytes"] <= total == event["total_bytes"] for event in progress)
+    complete = events[-1]
+    assert complete["event"] == "complete"
+    assert complete["size_bytes"] == total == complete["total_bytes"]
+    assert complete["stale_bytes"] == 28_000
+    assert complete["stale_files"] == 2
+    assert complete["disk_bytes"] > total
+    assert result["size_bytes"] == total
+    assert result["stale_bytes"] == 28_000
+    assert result["resumed_existing"] is False
+    assert result["reused_existing"] is False
+    assert (dest / "model.safetensors").read_bytes() == _TINY_REPO_FILES["model.safetensors"]
+    # The stray partial next to the weights does not make the model "partial".
+    assert hf_loader.cached_model_is_complete(dest)
+
+
+def test_pull_reuse_reports_the_models_bytes_not_the_folders(monkeypatch, tmp_path):
+    from mtplx import hf_loader
+
+    _install_fake_hub(monkeypatch, _TINY_REPO_FILES)
+    cache = tmp_path / "cache"
+    dest = cache / "org--tiny"
+    for name, content in _TINY_REPO_FILES.items():
+        _write_bytes(dest / name, len(content))
+    hf_loader._write_source_marker(
+        dest,
+        repo_id="org/tiny",
+        revision=None,
+        resolved_sha="abc123",
+        files={name: {"size": len(content), "blob_id": f"blob-{name}"} for name, content in _TINY_REPO_FILES.items()},
+    )
+    _write_bytes(dest / ".cache" / "huggingface" / "download" / "old.incomplete", 20_000)
+    events: list[dict] = []
+
+    result = hf_loader.pull_model("org/tiny", cache_dir=cache, progress_callback=events.append)
+
+    total = sum(len(content) for content in _TINY_REPO_FILES.values())
+    assert result["reused_existing"] is True
+    assert [event["event"] for event in events] == ["complete"]
+    assert events[0]["size_bytes"] == total == events[0]["total_bytes"]
+    assert events[0]["stale_bytes"] == 20_000
+    assert events[0]["disk_bytes"] >= total + 20_000
+    assert result["size_bytes"] == total
+    assert result["stale_bytes"] == 20_000
+
+
+def test_inspect_reports_vision_capability_from_metadata(tmp_path):
+    """Capable needs all three: vision_config, tower tensors, the preprocessor."""
+
+    config = {
+        "model_type": "qwen3_5",
+        "text_config": {"model_type": "qwen3_5_text", "hidden_size": 8},
+        "vision_config": {"patch_size": 16},
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    weight_map = {
+        "language_model.model.embed_tokens.weight": "model.safetensors",
+        "vision_tower.merger.linear_fc2.weight": "model.safetensors",
+        "vision_tower.patch_embed.proj.weight": "model.safetensors",
+    }
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": weight_map}), encoding="utf-8"
+    )
+    vision = inspect_model(tmp_path).to_dict()["vision"]
+    assert vision == {
+        "declared": True,
+        "tower_tensors": 2,
+        "preprocessor_config": False,
+        "capable": False,
+    }
+
+    (tmp_path / "preprocessor_config.json").write_text("{}", encoding="utf-8")
+    assert inspect_model(tmp_path).to_dict()["vision"]["capable"] is True
+
+    # A pack that lost its tower tensors is not capable, whatever config says.
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"language_model.model.embed_tokens.weight": "x"}}),
+        encoding="utf-8",
+    )
+    stripped = inspect_model(tmp_path).to_dict()["vision"]
+    assert stripped["declared"] is True and stripped["capable"] is False
+

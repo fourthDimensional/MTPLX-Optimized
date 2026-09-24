@@ -13,7 +13,7 @@ public struct OpenCodeConfigResult: Equatable, Sendable {
     public let configPath: String
     public let baseURL: String
     public let modelReference: String
-    public let legacySessionHeadersPluginPath: String
+    public let sessionHeadersPluginPath: String
     public let didChange: Bool
     public let backupPath: String?
     public let reasoningVisibilityPath: String
@@ -78,6 +78,64 @@ public struct OpenCodeIntegration: Sendable {
     private static let desktopGlobalStoreName = "opencode.global.dat"
     private static let sessionHeadersPluginName = "mtplx-session-headers.js"
 
+    /// The managed OpenCode plugin both writers install (byte-identical to
+    /// `mtplx.opencode.OPENCODE_SESSION_HEADERS_PLUGIN_SOURCE`; both compare
+    /// content before rewriting, so the lanes never fight). It carries the
+    /// session headers and strips exactly the client-injected values —
+    /// OpenCode's 32,000 output ceiling (provider/transform.ts
+    /// OUTPUT_TOKEN_MAX, min'd against limit.output on every request) and
+    /// the qwen-keyed sampler OpenCode <= 1.18.20 injects — so MTPLX owns
+    /// the uncapped generation contract while every explicit client choice
+    /// passes through untouched.
+    private static let sessionHeadersPluginSource = """
+    const mtplxProviderID = (input) =>
+      input?.model?.providerID || input?.provider?.id;
+
+    const mtplxInjectedOutputCap = 32000;
+    const mtplxInjectedQwenTemperature = 0.55;
+    const mtplxInjectedQwenTopP = 1;
+
+    export const MTPLXSessionHeaders = async () => ({
+      "chat.headers": async (input, output) => {
+        output.headers ||= {};
+        const providerID = mtplxProviderID(input);
+        if (providerID && providerID !== "mtplx") return;
+        output.headers["x-mtplx-client"] = "opencode";
+        if (input?.sessionID) {
+          output.headers["x-mtplx-session-id"] = String(input.sessionID);
+        }
+      },
+      "chat.params": async (input, output) => {
+        const providerID = mtplxProviderID(input);
+        if (providerID && providerID !== "mtplx") return;
+        // OpenCode injects maxOutputTokens = min(limit.output, 32000) on every
+        // request even when the configured model advertises a larger native
+        // context. Strip exactly that injected default so MTPLX owns the
+        // uncapped generation contract; an explicit client cap (any other
+        // value) passes through untouched.
+        if (output.maxOutputTokens === mtplxInjectedOutputCap) {
+          output.maxOutputTokens = undefined;
+        }
+        // OpenCode <= 1.18.20 (Desktop 1.18.18 included) injects a qwen-keyed
+        // sampler (temperature 0.55, topP 1) for any model id containing
+        // "qwen"; 1.18.21 removed the rule. Strip exactly that injected pair so
+        // the MTPLX server's family-native sampler applies; any other value is
+        // a deliberate client choice and passes through untouched.
+        const modelID = String(input?.model?.id ?? input?.model?.modelID ?? "").toLowerCase();
+        if (modelID.includes("qwen")) {
+          if (output.temperature === mtplxInjectedQwenTemperature) {
+            output.temperature = undefined;
+          }
+          if (output.topP === mtplxInjectedQwenTopP) {
+            output.topP = undefined;
+          }
+        }
+      }
+    });
+    export default MTPLXSessionHeaders;
+
+    """
+
     public let configURL: URL
     public let desktopSettingsStoreURL: URL
     public let desktopBundleIdentifier: String
@@ -127,13 +185,21 @@ public struct OpenCodeIntegration: Sendable {
                 modelID: modelID,
                 baseURL: baseURL,
                 apiKey: configuration.apiKey,
-                contextLimit: contextLimit
+                contextLimit: contextLimit,
+                vision: MTPLXModelOption.supportsVision(model: configuration.model),
+                reasoningEffort: Self.resolvedReasoningEffort(
+                    forModelID: modelID,
+                    configuredEffort: configuration.reasoningEffort
+                )
             )
         )
         root["provider"] = .object(providers)
         root["model"] = .string(modelReference)
         root["small_model"] = .string(modelReference)
-        _ = Self.removeManagedSessionHeadersPlugin(from: &root)
+        _ = Self.ensureManagedSessionHeadersPlugin(
+            in: &root,
+            path: sessionHeadersPluginURL.path
+        )
         if root["$schema"] == nil {
             root["$schema"] = .string("https://opencode.ai/config.json")
         }
@@ -146,7 +212,7 @@ public struct OpenCodeIntegration: Sendable {
             at: configURL.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
-        let legacyPluginFileDidChange = try Self.removeLegacySessionHeadersPluginFileIfPresent(
+        let pluginFileDidChange = try Self.installSessionHeadersPluginFile(
             at: sessionHeadersPluginURL
         )
 
@@ -158,8 +224,8 @@ public struct OpenCodeIntegration: Sendable {
                 configPath: configURL.path,
                 baseURL: baseURL,
                 modelReference: modelReference,
-                legacySessionHeadersPluginPath: sessionHeadersPluginURL.path,
-                didChange: legacyPluginFileDidChange || visibility.didChange,
+                sessionHeadersPluginPath: sessionHeadersPluginURL.path,
+                didChange: pluginFileDidChange || visibility.didChange,
                 backupPath: nil,
                 reasoningVisibilityPath: visibility.path,
                 reasoningVisibilityDidChange: visibility.didChange,
@@ -180,7 +246,7 @@ public struct OpenCodeIntegration: Sendable {
             configPath: configURL.path,
             baseURL: baseURL,
             modelReference: modelReference,
-            legacySessionHeadersPluginPath: sessionHeadersPluginURL.path,
+            sessionHeadersPluginPath: sessionHeadersPluginURL.path,
             didChange: true,
             backupPath: backupURL?.path,
             reasoningVisibilityPath: visibility.path,
@@ -207,7 +273,7 @@ public struct OpenCodeIntegration: Sendable {
                 wasRunning: false,
                 didTerminateExistingInstance: false,
                 didOpen: false,
-                detail: "OpenCode.app not found at \(desktopApplicationURL.path)"
+                detail: tr("OpenCode.app not found at %@", desktopApplicationURL.path)
             )
         }
         guard isCurrent?() ?? true else { return staleDesktopHandoffResult() }
@@ -287,7 +353,7 @@ public struct OpenCodeIntegration: Sendable {
             wasRunning: false,
             didTerminateExistingInstance: false,
             didOpen: false,
-            detail: "AppKit is unavailable"
+            detail: tr("AppKit is unavailable")
         )
         #endif
     }
@@ -300,7 +366,7 @@ public struct OpenCodeIntegration: Sendable {
             wasRunning: false,
             didTerminateExistingInstance: false,
             didOpen: false,
-            detail: "OpenCode handoff cancelled because the daemon lifecycle changed.",
+            detail: tr("OpenCode handoff cancelled because the daemon lifecycle changed."),
             launchedProcessID: launchedDesktopIdentity?.processID,
             launchedDesktopIdentity: launchedDesktopIdentity
         )
@@ -333,6 +399,18 @@ public struct OpenCodeIntegration: Sendable {
     }
 
     public static func modelID(for model: String) -> String {
+        // Exact released identities, including legacy Bonsai folder/served
+        // aliases. MiMo must match here: its names also contain "qwen" and
+        // "optimized-speed", which the generic branch below claims for the
+        // Qwen 3.6 27B.
+        if let option = MTPLXModelOption.option(matching: model),
+           [
+               "flash-next-optimized-quality",
+               "bonsai-2-27b-optimized-speed",
+               "mimo-v26-qwen-9b-optimized-speed",
+           ].contains(option.id) {
+            return "mtplx-\(option.id)"
+        }
         let lower = model.lowercased()
         if lower.contains("gemma4") || lower.contains("gemma-4") {
             return "gemma4-mtplx-optimized-speed"
@@ -356,6 +434,23 @@ public struct OpenCodeIntegration: Sendable {
             || lower.contains("qwen3-5-4b")
         {
             return "qwen3.5-4b-mtplx-optimized-speed"
+        }
+        // Flash-Next (qwen4_exp) before the 3.8 branch: the pack names
+        // carry "Qwen3.8-Flash-Next"+"bare-speed"/"optimized-speed" and
+        // would otherwise be claimed by the 27B ids below (engine twin:
+        // default_models._public_model_id_from_name resolves flash-next
+        // first). Derivative names fall through to the sanitized id.
+        if lower.contains("flash-next") || lower.contains("flash_next") {
+            if lower.contains("bare-speed") {
+                return "mtplx-flash-next-bare-speed"
+            }
+            if lower.contains("optimized-speed") {
+                return "mtplx-flash-next-optimized-speed"
+            }
+        }
+        if (lower.contains("flash-next") || lower.contains("flash_next"))
+            && lower.contains("optimized-quality") {
+            return sanitizedModelID(from: model)
         }
         // Qwen 3.8 family before the generic qwen branches: a 3.8 name
         // also contains "qwen"+"optimized-speed"/"optimized-quality" and
@@ -394,6 +489,10 @@ public struct OpenCodeIntegration: Sendable {
             return "mtplx-qwen36-27b-gdn8-speed4"
         }
 
+        return sanitizedModelID(from: model)
+    }
+
+    private static func sanitizedModelID(from model: String) -> String {
         let lastComponent = URL(fileURLWithPath: model).lastPathComponent
         let seed = lastComponent.isEmpty ? model : lastComponent
         let sanitized = seed
@@ -449,8 +548,73 @@ public struct OpenCodeIntegration: Sendable {
         return true
     }
 
+    /// Swift twin of `descriptors.reasoning_policy_for_model` for the
+    /// OpenCode config surface: nil = no verified reasoning codec, [] =
+    /// reasoning without an effort dial (Qwen3.5/3.6 trunk), a list = the
+    /// family effort dial.
+    public static func reasoningEffortLevels(forModelID modelID: String) -> [String]? {
+        let lower = modelID.lowercased()
+        if MTPLXModelOption.isBonsai2Model(modelID) {
+            return ["xhigh", "medium"]
+        }
+        // Flash-Next (qwen4_exp) before the 3.8 markers: the pack names
+        // carry "Qwen3.8-Flash-Next" and would otherwise be claimed by the
+        // 27B codec below (engine twin: descriptors._QWEN4_PREVIEW_MARKER
+        // routes flash-next away first).
+        if lower.contains("flash-next") || lower.contains("flash_next") || lower.contains("qwen4") {
+            // QWEN4_EXP_REASONING_CODEC: same official effort triple.
+            return ["xhigh", "medium", "low"]
+        }
+        if MTPLXModelOption.modelFamily(for: modelID) == "qwen3_8" {
+            // QWEN3_8_REASONING_CODEC: official reasoning_effort levels.
+            return ["xhigh", "medium", "low"]
+        }
+        if lower.contains("step") {
+            return ["low", "medium", "high"]
+        }
+        if lower.contains("qwen") {
+            return []
+        }
+        return nil
+    }
+
     public static func reasoningEffort(forModelID modelID: String) -> String? {
-        modelID.lowercased().contains("step") ? "low" : nil
+        let lower = modelID.lowercased()
+        if lower.contains("flash-next") || lower.contains("flash_next") || lower.contains("qwen4") {
+            // Agent-lane default is medium (engine codec default_agent_effort):
+            // the 2026-08-28 wall-clock A/B on the identical multifile coding
+            // task measured xhigh 150.2s vs medium 44.2s with the same correct
+            // output. Chat surfaces keep the family chat default (xhigh); the
+            // OpenCode effort picker still offers xhigh per request. Checked
+            // before the 3.8 markers, which the pack names also contain.
+            return "medium"
+        }
+        if MTPLXModelOption.modelFamily(for: modelID) == "qwen3_8" {
+            // QWEN3_8_REASONING_CODEC default: medium (strict max-fan A/B,
+            // 2026-08-14 — same correct uncapped result 51.52s vs 314.91s
+            // at xhigh).
+            return "medium"
+        }
+        return lower.contains("step") ? "low" : nil
+    }
+
+    /// The effort OpenCode's model entry carries: the app dial when the user
+    /// set one, otherwise the family default. Explicit effort choices made
+    /// inside OpenCode merge after model options and win per request.
+    public static func resolvedReasoningEffort(
+        forModelID modelID: String,
+        configuredEffort: String?
+    ) -> String? {
+        guard reasoningEffortLevels(forModelID: modelID) != nil else { return nil }
+        if let configured = configuredEffort?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased(),
+            !configured.isEmpty,
+            configured != "auto"
+        {
+            return configured
+        }
+        return reasoningEffort(forModelID: modelID)
     }
 
     public func repairDesktopStateBeforeLaunch() -> OpenCodeDesktopStateRepairResult {
@@ -478,34 +642,47 @@ public struct OpenCodeIntegration: Sendable {
         }
     }
 
-    private static func removeManagedSessionHeadersPlugin(from root: inout [String: JSONValue]) -> Bool {
-        guard let current = root["plugin"] else { return false }
-        if let plugins = current.arrayValue {
-            let remaining = plugins.filter { plugin in
-                guard let path = plugin.stringValue else { return true }
-                return URL(fileURLWithPath: path).lastPathComponent != sessionHeadersPluginName
-            }
-            let didChange = remaining.count != plugins.count
-            if remaining.isEmpty {
-                root["plugin"] = nil
+    /// Register the managed plugin in the config's `plugin` list, replacing
+    /// any stale registration of the same basename under another path (a
+    /// duplicate would double-fire the hooks).
+    private static func ensureManagedSessionHeadersPlugin(
+        in root: inout [String: JSONValue],
+        path: String
+    ) -> Bool {
+        let existing: [JSONValue]
+        if let current = root["plugin"] {
+            if let plugins = current.arrayValue {
+                existing = plugins
             } else {
-                root["plugin"] = .array(remaining)
+                existing = [current]
             }
-            return didChange
+        } else {
+            existing = []
         }
-        if let path = current.stringValue,
-           URL(fileURLWithPath: path).lastPathComponent == sessionHeadersPluginName {
-            root["plugin"] = nil
-            return true
+        var next = existing.filter { plugin in
+            guard let pluginPath = plugin.stringValue else { return true }
+            if pluginPath == path { return true }
+            return URL(fileURLWithPath: pluginPath).lastPathComponent != sessionHeadersPluginName
         }
-        return false
+        if !next.contains(where: { $0.stringValue == path }) {
+            next.append(.string(path))
+        }
+        let didChange = next != existing
+        root["plugin"] = .array(next)
+        return didChange
     }
 
-    private static func removeLegacySessionHeadersPluginFileIfPresent(at url: URL) throws -> Bool {
-        guard FileManager.default.fileExists(atPath: url.path) else {
+    /// Write the managed plugin next to opencode.json. Content-compared
+    /// before writing so repeat launches (and the Python `mtplx start
+    /// opencode` writer, which installs the identical bytes) never churn
+    /// the file.
+    private static func installSessionHeadersPluginFile(at url: URL) throws -> Bool {
+        let data = Data(sessionHeadersPluginSource.utf8)
+        if let existing = try? Data(contentsOf: url), existing == data {
             return false
         }
-        try FileManager.default.removeItem(at: url)
+        try data.write(to: url, options: [.atomic])
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
         return true
     }
 
@@ -716,11 +893,48 @@ public struct OpenCodeIntegration: Sendable {
         return text
     }
 
+    /// OpenCode's built-in effort tiers for reasoning-capable
+    /// openai-compatible models (sst/opencode provider/transform.ts
+    /// OPENAI_EFFORTS, identical at 1.18.18 and 1.18.21). The generated
+    /// config disables the tiers a family contract does not define so
+    /// OpenCode's effort picker mirrors the MTPLX dial.
+    private static let openCodeDefaultEffortTiers = [
+        "none", "minimal", "low", "medium", "high", "xhigh",
+    ]
+
+    private static func effortVariants(familyLevels: [String]) -> [String: JSONValue] {
+        var variants: [String: JSONValue] = [:]
+        for tier in openCodeDefaultEffortTiers where !familyLevels.contains(tier) {
+            variants[tier] = .object(["disabled": .bool(true)])
+        }
+        // Every family tier is declared as an explicit variant, not only the
+        // ones outside OPENAI_EFFORTS: Desktop 1.18.21's picker does not
+        // surface its full built-in list for a custom openai-compatible
+        // provider (xhigh was missing live for the Flash-Next dial while
+        // low/medium rendered). An explicit variant renders on every version
+        // and merges over a same-named built-in.
+        for level in familyLevels {
+            variants[level] = .object(["reasoningEffort": .string(level)])
+        }
+        return variants
+    }
+
+    /// OpenCode plans `min(limit.output, 32_000)` of the window for the reply
+    /// and compacts once a turn's total tokens reach the rest (overflow.ts,
+    /// 1.18.29). Mirroring the context into the output limit left a zero-token
+    /// conversation window on small seats, so every reply was summarised
+    /// (issue #480). Half the window, capped at the 32,000 OpenCode injects.
+    static func outputLimit(forContextWindow context: Int) -> Int {
+        min(32_000, max(1, context / 2))
+    }
+
     private static func providerConfig(
         modelID: String,
         baseURL: String,
         apiKey: String?,
-        contextLimit: Int
+        contextLimit: Int,
+        vision: Bool,
+        reasoningEffort: String?
     ) -> [String: JSONValue] {
         var options: [String: JSONValue] = [
             "baseURL": .string(baseURL),
@@ -734,25 +948,48 @@ public struct OpenCodeIntegration: Sendable {
             options["apiKey"] = .string(apiKey)
         }
 
+        // Reasoning + temperature are declared capable so OpenCode
+        // round-trips assistant reasoning_content (preserve_thinking) and
+        // transmits explicit client-side choices; with nothing chosen,
+        // OpenCode 1.18.21 sends no sampler for MTPLX model ids and the
+        // server's family defaults (the app's source of truth) apply. The
+        // family sampler is deliberately not written into model options:
+        // @ai-sdk/openai-compatible 2.0.41 has no per-model sampler
+        // transport, only reasoningEffort rides options.
+        let effortLevels = Self.reasoningEffortLevels(forModelID: modelID)
+        let reasoningSupported = effortLevels != nil
+        var model: [String: JSONValue] = [
+            "name": .string("MTPLX \(modelID)"),
+            "reasoning": .bool(reasoningSupported),
+            "tool_call": .bool(true),
+            "temperature": .bool(true),
+            "limit": .object([
+                "context": .number(Double(contextLimit)),
+                "output": .number(Double(Self.outputLimit(forContextWindow: contextLimit))),
+            ]),
+            "modalities": .object([
+                "input": .array(vision ? [.string("text"), .string("image")] : [.string("text")]),
+                "output": .array([.string("text")]),
+            ]),
+        ]
+        if let effortLevels {
+            if let reasoningEffort, !reasoningEffort.isEmpty {
+                model["options"] = .object([
+                    "reasoningEffort": .string(reasoningEffort)
+                ])
+            }
+            let variants = Self.effortVariants(familyLevels: effortLevels)
+            if !variants.isEmpty {
+                model["variants"] = .object(variants)
+            }
+        }
+
         return [
             "npm": .string("@ai-sdk/openai-compatible"),
             "name": .string("MTPLX (local)"),
             "options": .object(options),
             "models": .object([
-                modelID: .object([
-                    "name": .string("MTPLX \(modelID)"),
-                    "reasoning": .bool(false),
-                    "tool_call": .bool(true),
-                    "temperature": .bool(false),
-                    "limit": .object([
-                        "context": .number(Double(contextLimit)),
-                        "output": .number(Double(contextLimit)),
-                    ]),
-                    "modalities": .object([
-                        "input": .array([.string("text")]),
-                        "output": .array([.string("text")]),
-                    ]),
-                ]),
+                modelID: .object(model),
             ]),
         ]
     }
