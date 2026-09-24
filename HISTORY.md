@@ -14,7 +14,7 @@ The speed records, each with its conditions. Every number was measured on a MacB
 
 | Date | Model | tok/s | Conditions | Source |
 |---|---|---|---|---|
-| 22 September 2026 | Ternary Bonsai 2 27B, Optimized Speed | 50.0 and 42.6 | 4,061 and 16,350-token prompts, 512 tokens generated, MTP depth 1, native sampler, MTPLX 2.12.0; 38.8 and 34.3 with plain decoding | [2.12.0 notes](https://mtplx.com/releases/2.12.0/) |
+| 22 September 2026 | Ternary Bonsai 2 27B, Optimized Speed | 64.4 and 57.1 | 4,061 and 16,350-token prompts, 512 tokens generated, MTP depth 1, native sampler, MTPLX 2.12.0 with its Bonsai kernels (50.4 and 45.2 without them) | [2.12.0 notes](https://mtplx.com/releases/2.12.0/) |
 | 16 September 2026 | Qwen 3.8 Flash Next, Optimized Speed | 125.8 | one OpenCode request, 1,301 tokens generated, 18,539-token prompt with 18,364 tokens served from cache, MTP depth 3, MTPLX 2.11.3 | [2.11.3 notes](https://mtplx.com/releases/2.11.3/) |
 | 16 September 2026 | Qwen 3.8 Flash Next | 79.3 | 9k-token code prompt, 1,500 tokens generated, seeded sampler, thinking off, two alternating boots each; 62.5 on 2.11.2 | [2.11.3 notes](https://mtplx.com/releases/2.11.3/) |
 | 29 August 2026 | Qwen 3.8 27B, Optimized Speed | 87.6 | rewriting a file it just wrote, stock settings, MTPLX 2.10.0 | [2.10.0 notes](https://mtplx.com/releases/2.10.0/) |
