@@ -860,7 +860,7 @@ def resolve_request_policy(
         )
     elif not thinking_enabled:
         request_reasoning_mode = "off"
-    elif requested_enable_thinking is True and server_reasoning_mode == "auto":
+    elif requested_enable_thinking is True:
         request_reasoning_mode = "on"
     else:
         request_reasoning_mode = server_reasoning_mode

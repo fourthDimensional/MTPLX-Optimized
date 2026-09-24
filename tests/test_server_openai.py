@@ -4845,10 +4845,11 @@ def test_transparent_qwen38_rejects_effort_without_an_effort_aware_template(
     assert "froggeric_v22_1" in response.json()["error"]["message"]
 
 
-def test_legacy_opencode_middleware_keeps_reasoning_effort_server_owned(monkeypatch):
+def test_legacy_opencode_middleware_honors_explicit_app_reasoning_control(monkeypatch):
     captured: dict[str, object] = {}
     state = _qwen38_reasoning_state(agent_middleware="on")
     state.args.reasoning_effort = "low"
+    state.args.managed_client_controls = "app"
     client = TestClient(create_app(state))
     monkeypatch.setattr(
         openai, "_run_generation", _reasoning_capture_generation(captured)
@@ -9219,8 +9220,9 @@ def test_compact_tool_contract_keeps_a_late_task_tool_in_the_allowlist():
 
     contract = openai._mtplx_tool_contract_text(tools)
 
-    assert "task(payload_0:string" in contract
-    assert "tool_0(payload_0:string" in contract
+    declared = contract.split("Declared tools and schemas: ", 1)[1].split(". Call only", 1)[0]
+    assert "task" in declared.split("; ")
+    assert "tool_0(payload_0:string" in declared
 
     openai._encode_messages(
         tokenizer,
@@ -9235,7 +9237,8 @@ def test_compact_tool_contract_keeps_a_late_task_tool_in_the_allowlist():
         str(message.get("content") or "") for message in messages
     )
     assert "tools" not in kwargs
-    assert "task(payload_0:string" in rendered_content
+    rendered_declared = rendered_content.split("Declared tools and schemas: ", 1)[1].split(". Call only", 1)[0]
+    assert "task" in rendered_declared.split("; ")
 
 
 def test_compact_tool_prompt_mode_still_validates_real_tool_schema():

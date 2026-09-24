@@ -15481,7 +15481,6 @@ def _postcommit_next_turn_prefix_ids(
         )
         if item is not None:
             normalized.append(item)
-            last_history_role = str(item.get("role") or "")
     item = (
         _message_to_template_dict(
             sentinel_message,
@@ -34347,7 +34346,6 @@ def create_app(state: ServerState) -> FastAPI:
                     if (
                         not agent_middleware_active
                         or not tools_active
-                        or not tool_result_history_present
                         or not thinking_enabled
                         or request.seed is not None
                         or _reasoning_parser_for_state(state)
